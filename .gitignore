@@ -1,0 +1,12 @@
+.DS_Store
+.env
+.env.*
+!.env.example
+target/
+node_modules/
+dist/
+.idea/
+.vscode/
+*.log
+# Local reference code, not part of CipherLab
+archive/

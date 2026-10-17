@@ -1,0 +1,12 @@
+# Development fallback: in-memory H2 in PostgreSQL compatibility mode.
+# Used when Docker/PostgreSQL is unavailable (e.g. CI or restricted VMs).
+# Production must use the default profile with a real PostgreSQL instance.
+spring:
+  datasource:
+    url: jdbc:h2:mem:cipherlab;MODE=PostgreSQL;DATABASE_TO_LOWER=TRUE;DEFAULT_NULL_ORDERING=HIGH;DB_CLOSE_DELAY=-1
+    driver-class-name: org.h2.Driver
+    username: sa
+    password: password
+  jpa:
+    hibernate:
+      ddl-auto: none
