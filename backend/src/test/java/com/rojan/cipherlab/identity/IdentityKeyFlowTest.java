@@ -235,6 +235,91 @@ class IdentityKeyFlowTest {
                 .andExpect(jsonPath("$.code").value("INVALID_KEY"));
     }
 
+    /** Any RSA keypair, DER + Base64, as a client would upload. */
+    private String generatedRsaPublicKeyBase64(int bits) throws Exception {
+        KeyPairGenerator generator = KeyPairGenerator.getInstance("RSA");
+        generator.initialize(bits);
+        return Base64.getEncoder().encodeToString(generator.generateKeyPair().getPublic().getEncoded());
+    }
+
+    /** A real EC key on a NON-P-256 curve. */
+    private String generatedP384PublicKeyBase64() throws Exception {
+        KeyPairGenerator generator = KeyPairGenerator.getInstance("EC");
+        generator.initialize(new java.security.spec.ECGenParameterSpec("secp384r1"));
+        return Base64.getEncoder().encodeToString(generator.generateKeyPair().getPublic().getEncoded());
+    }
+
+    @Test
+    @DisplayName("Random bytes labeled EC_P256 are rejected — the key material is parsed, not trusted")
+    void randomBytesRejected() throws Exception {
+        User user = newUser();
+        byte[] garbage = new byte[64];
+        new java.security.SecureRandom().nextBytes(garbage);
+
+        mockMvc.perform(post("/api/v1/identity/keys")
+                        .header("Authorization", "Bearer " + user.token())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"keyType\":\"EC_P256\",\"publicKey\":\""
+                                + Base64.getEncoder().encodeToString(garbage) + "\"}"))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.code").value("INVALID_KEY"));
+    }
+
+    @Test
+    @DisplayName("A P-384 key labeled EC_P256 is rejected — wrong curve")
+    void wrongCurveRejected() throws Exception {
+        User user = newUser();
+        mockMvc.perform(post("/api/v1/identity/keys")
+                        .header("Authorization", "Bearer " + user.token())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"keyType\":\"EC_P256\",\"publicKey\":\""
+                                + generatedP384PublicKeyBase64() + "\"}"))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.code").value("INVALID_KEY"));
+    }
+
+    @Test
+    @DisplayName("RSA modulus size is enforced: 1024-bit rejected, 2048-bit accepted")
+    void rsaModulusSizeEnforced() throws Exception {
+        User user = newUser();
+        mockMvc.perform(post("/api/v1/identity/keys")
+                        .header("Authorization", "Bearer " + user.token())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"keyType\":\"RSA_2048\",\"publicKey\":\""
+                                + generatedRsaPublicKeyBase64(1024) + "\"}"))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.code").value("INVALID_KEY"));
+
+        mockMvc.perform(post("/api/v1/identity/keys")
+                        .header("Authorization", "Bearer " + user.token())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"keyType\":\"RSA_2048\",\"publicKey\":\""
+                                + generatedRsaPublicKeyBase64(2048) + "\"}"))
+                .andExpect(status().isCreated())
+                .andExpect(jsonPath("$.keyType").value("RSA_2048"));
+    }
+
+    @Test
+    @DisplayName("Declared type must match the actual key — RSA bytes cannot pose as EC_P256")
+    void typeMismatchRejected() throws Exception {
+        User user = newUser();
+        mockMvc.perform(post("/api/v1/identity/keys")
+                        .header("Authorization", "Bearer " + user.token())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"keyType\":\"EC_P256\",\"publicKey\":\""
+                                + generatedRsaPublicKeyBase64(2048) + "\"}"))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.code").value("INVALID_KEY"));
+
+        mockMvc.perform(post("/api/v1/identity/keys")
+                        .header("Authorization", "Bearer " + user.token())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"keyType\":\"RSA_2048\",\"publicKey\":\""
+                                + generatedPublicKeyBase64() + "\"}"))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.code").value("INVALID_KEY"));
+    }
+
     @Test
     @DisplayName("Identity endpoints require authentication")
     void identityEndpointsRequireAuth() throws Exception {
