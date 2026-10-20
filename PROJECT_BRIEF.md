@@ -2,8 +2,8 @@
 
 > This document is self-contained. An agent with no prior context should be able to
 > understand the project, run it, verify it, and continue working on it using only
-> this file plus the repository. Written 2026-10-20, reflecting the state at commit
-> `9abd3f4` + this brief.
+> this file plus the repository. Updated after the v1.1 security-remediation pass
+> (standard JWT, signed session handshake, real Web Crypto encryption).
 
 ---
 
@@ -18,10 +18,11 @@ Two halves:
    properties visible: AES-256-GCM tamper detection, hash vs HMAC, toy Diffie–Hellman,
    HKDF key derivation, ECDSA signatures, and a controlled MITM simulation that succeeds
    without signatures and fails with them.
-2. **Secure Messenger** — register/login (BCrypt + hand-rolled HS256 JWT), public-key
-   identity registry with server-computed fingerprints, conversations, a two-party
-   session lifecycle (`PENDING` → `ACTIVE`), and a **ciphertext-only relay** with
-   server-side replay rejection.
+2. **Secure Messenger** — register/login (BCrypt + standard Nimbus HS256 JWT), public-key
+   identity registry with server-computed fingerprints and parsed key-material validation,
+   conversations, a **signed ephemeral ECDH handshake** (`PENDING` → `ACTIVE` only after
+   both signatures verify), browser-side AES-256-GCM with directional HKDF keys and
+   AAD binding, plus a ciphertext-only relay with server-side replay rejection.
 
 Central invariant: **the server never holds a key that can decrypt user traffic.**
 No column in the database stores private keys, derived session keys, or plaintext.
@@ -34,15 +35,18 @@ real keys.
 
 ## 2. Current status
 
-**Complete for v1 scope. Working tree clean. All checks green.**
+**v1.1 security remediation complete. Working tree clean. All checks green.**
 
-- 87/87 backend tests pass (`./mvnw -B clean test`, exit 0)
-- Frontend: `oxlint` 0 warnings / 0 errors; `tsc -b && vite build` exit 0
-- Live end-to-end verified: register → 201, login → 200 (JWT issued), `/auth/me` with
-  that token → 200; `/lab/hash` returns the correct NIST SHA-256 vector for "abc";
-  signed-out protected call → the standard 401 error body
-- Not yet done (external): pushing to GitHub so the CI workflow actually executes;
-  any production deployment.
+- Backend: `./mvnw -B clean test` → **100/100, exit 0** (was 87 pre-remediation)
+- Frontend: `npm ci` → `oxlint` 0/0 → `npm test` (vitest) **11/11** → `tsc -b && vite build` exit 0
+- Real-launcher boot checks: missing `JWT_SECRET` → **exit 1** with explanation;
+  known dev secret outside the dev profile → **exit 1**; dev profile boots with the V2 migration
+- Live end-to-end: register → login → `/auth/me` over the proxy; `/lab/hash` NIST vector;
+  signed-out protected call → 401 contract intact
+- Not yet done (external): pushing to GitHub so CI executes; any production deployment;
+  two-browser interactive verification of the handshake UI (scripted protocol coverage
+  exists in MockMvc + vitest; see §14 for the manual test plan)
+- **`cipherlab-v1.zip` predates this remediation pass** (regenerate only if requested)
 
 ### Git history (chronological)
 
@@ -57,6 +61,10 @@ df0f73d feat(lab): HKDF-SHA-256, ECDSA P-256 signatures, and MITM simulation
 3ab9043 feat(frontend): crypto lab and secure messenger UI
 26cce0c refactor(frontend): split auth hook for Fast Refresh and fix lint warnings
 9abd3f4 docs: add architecture, threat model, API examples, and CI pipeline
+03d8d6e fix(security): standard Spring Security JWT + fail-fast secret policy
+d624ffc fix(identity): parse and validate public-key material against declared type
+397cc00 feat(messaging): authenticated signed-ephemeral ECDH session handshake
+2cd4b89 feat(frontend,messaging): real Web Crypto E2EE — signed handshake, AES-GCM, vitest suite
 ```
 
 ---
@@ -67,10 +75,10 @@ df0f73d feat(lab): HKDF-SHA-256, ECDSA P-256 signatures, and MITM simulation
 |---|---|
 | Backend | Java 21, Spring Boot 4, Maven (wrapper committed: `backend/mvnw`) |
 | API | REST under `/api/v1`, Bean Validation on every request DTO |
-| Security | Spring Security filter chain, hand-rolled HS256 JWT (no JWT library), BCrypt |
+| Security | Spring Security OAuth2 resource server (Nimbus: HS256 + issuer + expiry), BCrypt |
 | Persistence | Spring Data JPA, Flyway, PostgreSQL 17 (prod) / H2 in PostgreSQL mode (dev/tests) |
 | Frontend | React 19, TypeScript, Vite, oxlint |
-| Tests | JUnit 5 + MockMvc **over the real security filter chain with real tokens** |
+| Tests | JUnit 5 + MockMvc **over the real security filter chain with real tokens**; vitest for the browser crypto layer |
 | Delivery | Docker Compose (Postgres), GitHub Actions CI |
 
 ---
@@ -88,8 +96,9 @@ cd ../frontend && npm ci && npm run dev              # UI on :5173, proxies /api
 cd backend && ./mvnw spring-boot:run -Dspring-boot.run.profiles=dev
 
 # --- tests / build (exactly what CI runs) ---
-cd backend && ./mvnw -B clean test                   # 87 tests, no container needed
-cd frontend && npm ci && npm run lint && npm run build   # oxlint, then tsc -b + vite build
+cd backend && ./mvnw -B clean test                   # 100 tests, no container needed
+cd frontend && npm ci && npm run lint && npm test    # oxlint + vitest (11 crypto tests)
+cd frontend && npm run build                          # tsc -b + vite build
 ```
 
 - Production profile requires `JWT_SECRET` (min 32 chars); the app refuses to boot
@@ -117,7 +126,7 @@ cipherlab/
 │       ├── main/java/com/rojan/cipherlab/
 │       │   ├── CipherLabApplication.java
 │       │   ├── config/SecurityConfig.java        # the three security zones
-│       │   ├── security/                         # JwtService, JwtAuthenticationFilter,
+│       │   ├── security/                         # JwtService (Nimbus issue + decoder policy),
 │       │   │                                     # AuthenticatedUser, SecurityErrorResponses
 │       │   ├── common/                           # ApiError, ApiExceptionHandler, 6 exception
 │       │   │                                     # types, AuditService/AuditEvent, Experiment
@@ -143,6 +152,8 @@ cipherlab/
     └── src/
         ├── main.tsx, App.tsx (2-tab shell), App.css, index.css
         ├── lib/api.ts        # typed fetch client for EVERY endpoint + ApiError class
+        ├── lib/e2ee.ts       # Web Crypto: identity keys, signed transcript, HKDF, AES-GCM
+        ├── lib/e2ee.test.ts  # vitest suite proving the crypto layer (11 tests)
         ├── lib/auth.tsx      # AuthProvider: token in localStorage ('cipherlab.token')
         ├── lib/useAuth.ts    # context + hook (separate file for Fast Refresh)
         ├── lib/b64.ts        # base64/hex helpers
@@ -164,19 +175,27 @@ does not implement AES.
 1. `/actuator/health` — liveness only.
 2. **Public:** `/api/v1/lab/**` (stateless demos, no user data), `POST /api/v1/auth/register`,
    `POST /api/v1/auth/login` (the only ways to get a token).
-3. **Authenticated:** everything else — the JWT filter verifies the bearer token per
-   request; there is no HTTP session anywhere.
+3. **Authenticated:** everything else — Spring Security's resource-server filter
+   verifies the bearer token per request (Nimbus); there is no HTTP session anywhere.
 
 CSRF is disabled **by construction**: no cookies exist, the token travels in the
 `Authorization` header, which cross-site forms/images cannot set.
 
-### JWT pipeline (`JwtService`) — hand-rolled, no library
+### JWT pipeline — standard Spring Security OAuth2 resource server (Nimbus)
 
-- `alg` header must be exactly `HS256`; `none`/swapped algorithms rejected before any
-  crypto runs (classic `alg=none` defense).
-- Constant-time MAC comparison via `MessageDigest.isEqual` (not `String.equals`).
-- Verification order: **format → algorithm → signature → claims.** Expiry is checked
-  only after the signature passes, so a forged `exp` cannot survive a bad signature.
+- `JwtService.issueToken` signs with Nimbus `MACSigner` (HS256); claims are
+  `sub`, `username`, `iss`, `iat`, `exp`.
+- The `JwtDecoder` bean (built by `JwtService.createDecoder()`, the single
+  construction site shared by production and tests) enforces signature,
+  **issuer**, and expiry on every request. `alg=none` and algorithm swaps are
+  rejected by the JOSE processor before any claim is read.
+- **Secret policy fails startup** when the secret is missing/blank, under 32
+  chars, or the publicly known dev value outside the `dev` profile (where it
+  now lives, in `application-dev.yml`). Proven by unit tests AND by launching
+  the packaged jar (exit 1 + explanation).
+- A custom converter maps verified claims onto the `AuthenticatedUser`
+  principal; the old hand-rolled filter and its regex claim parser are deleted
+  (that parser mangled usernames containing `,` or `}` — a real flaw).
 
 ### Error contract
 
@@ -215,7 +234,7 @@ UUID PKs assigned by the application, never accepted from a client.
 | `identity_keys` | **public_key only**, fingerprint, `key_version`; unique `(user_id, key_version)`; `revoked_at` |
 | `conversations` | id + created_at only |
 | `conversation_members` | composite PK `(conversation_id, user_id)` — membership checks ride this |
-| `crypto_sessions` | initiator/responder, suite, status (`PENDING`/`ACTIVE`), `expires_at`. **No key material.** |
+| `crypto_sessions` | initiator/responder, suite, status (`PENDING`/`ACTIVE`), `expires_at`, **public handshake material** (both ephemeral SPKI keys, both identity signatures, identity key ids, transcript hash from migration V2). **No private or derived key material.** |
 | `messages` | ciphertext + nonce + `sequence_number`; **`uq_messages_session_sender_seq` unique on `(session_id, sender_id, sequence_number)` = replay detection** |
 | `experiments` | optional lab-run log (user_id nullable) |
 | `audit_events` | actor, event_type, resource_id — no secrets |
@@ -274,9 +293,10 @@ All bodies/errors follow §6's contract. **[A]** = requires `Authorization: Bear
 | `POST /conversations` | `{partnerId}`; non-members/partners → 404 semantics |
 | `GET /conversations` | mine (membership-based) |
 | `GET /conversations/{id}/messages` | members only |
-| `POST /conversations/{id}/sessions` | creates session `PENDING`, responder must activate |
-| `GET /sessions/{sessionId}` | status polling |
-| `POST /sessions/{sessionId}/activate` | `PENDING → ACTIVE`; relay rejects otherwise |
+| `POST /conversations/{id}/sessions` | body `{sessionId, suite, ephemeralPublic, signature, identityKeyId}` — the initiator's **signed ephemeral**; server verifies the identity signature before the session exists; `PENDING` |
+| `GET /conversations/{id}/sessions` | members discover pending/active sessions (how the responder finds the handshake) |
+| `GET /sessions/{sessionId}` | full session incl. handshake material for peer verification |
+| `POST /sessions/{sessionId}/activate` | body `{ephemeralPublic, signature, identityKeyId}` — responder's signed ephemeral over the **full transcript**; verified server-side; `PENDING → ACTIVE` only then |
 | `POST /sessions/{sessionId}/messages` | the relay: `{sequenceNumber, nonce, ciphertext}` → `201`, or `400 REPLAYED_MESSAGE` |
 
 ---
@@ -293,10 +313,10 @@ Run: `cd backend && ./mvnw -B clean test` (H2 PostgreSQL mode — no container).
 | `SignatureServiceTest` | sign/verify, tamper rejection, invalid-key fail-closed |
 | `ToyDiffieHellmanServiceTest` | textbook `p=23 → s=2`, bounds enforcement |
 | `MitmSimulationTest` | attack succeeds unauthenticated; substitution caught with signatures |
-| `JwtServiceTest` | roundtrip, tampered payload/signature, `alg=none`, wrong secret, expiry |
+| `JwtServiceTest` | standard decoder: roundtrip, unicode, tampered payload/signature, `alg=none`, wrong secret, expiry, wrong issuer, malformed tokens, secret-policy refusals (12) |
 | `AuthFlowTest` | register→login→/me over the **real filter chain**; duplicate identity; oracle-free errors; hash never leaks |
-| `IdentityKeyFlowTest` | publish with independently recomputed fingerprint; rotation; revoke final |
-| `MessagingFlowTest` | full flow; replay rejected; lifecycle enforced; outsiders get 404 |
+| `IdentityKeyFlowTest` | publish with independently recomputed fingerprint; rotation; revoke final; **key material parsed** (garbage / wrong curve / wrong modulus / type mismatch rejected) |
+| `MessagingFlowTest` | full flow with a **real signed handshake**; replay rejected; lifecycle enforced; outsiders get 404; substituted ephemeral, wrong-key signature, bad transcript signature, revoked+foreign identity keys, malformed/oversized envelopes, duplicate session ids, TOY_DH suite label all rejected (13) |
 | `LabControllerTest` | all lab endpoints incl. validation bounds |
 | `AuditTrailTest` | auth + replay events recorded and carry no secrets |
 | `CipherLabApplicationTests` | context boots |
@@ -304,7 +324,10 @@ Run: `cd backend && ./mvnw -B clean test` (H2 PostgreSQL mode — no container).
 MockMvc tests use **real tokens issued by the running service**, not test doubles —
 the whole JWT pipeline is exercised end to end.
 
-Frontend has no unit tests (lint + tsc + build only) — known gap, see §12.
+Frontend: `npm test` runs vitest (11 tests) over `e2ee.ts` — fingerprint parity with
+the server, transcript signature verification (substituted key/ephemeral attacks),
+DER/raw round-trips, directional-key cross-decrypt, HKDF context separation, AAD
+relocation, bit-flip tampering, nonce freshness.
 
 ---
 
@@ -324,12 +347,15 @@ Frontend has no unit tests (lint + tsc + build only) — known gap, see §12.
   relay. Includes a **"Send replayed envelope"** button that resubmits the last sequence
   so the user watches the server reject it.
 
-**Honest limitation (documented in README + threat model):** the messenger UI currently
-sends **Base64 of the plaintext** as the "ciphertext" envelope so the UI can show a real
-value while demonstrating the *server-side* contract (session lifecycle + replay
-rejection). The server still never sees a key, and the relay path is real. Replacing
-this with actual browser-side ECDH + HKDF + AES-GCM via Web Crypto is the designated
-v2 milestone (§12).
+**Implemented messaging encryption (v1.1).** `frontend/src/lib/e2ee.ts` performs
+identity keygen (ECDSA P-256, private half memory-only + user-held backup file),
+transcript signing/verification (DER wire format compatible with the server's JCA),
+signed ephemeral ECDH, HKDF-SHA-256 directional keys with context separation, and
+AES-256-GCM with fresh 96-bit nonces and AAD binding
+`sessionId|conversationId|senderId|sequenceNumber`. The server still never sees a
+key; it relays ciphertext it cannot read, and rejects replayed or malformed
+envelopes. Undecryptable rows render as "undecryptable (tampered?)" rather than
+being faked.
 
 ---
 
@@ -357,7 +383,12 @@ Full version: `docs/threat-model.md`. Non-goals stated plainly:
 - **Two-party sessions only** — the per-sender replay constraint is correct for two
   senders, not groups.
 - **Tokens in localStorage** (teaching choice).
-- **Base64 envelope in the UI, not Web Crypto** (see §10).
+- **Identity private keys live in browser memory** (+ user-held backup file);
+  nothing sensitive in localStorage or on the server. A lost backup means a new
+  fingerprint your contact must re-verify.
+- **Fingerprint verification is trust-on-first-use** unless users compare out of
+  band as the UI instructs.
+- **Encryption keys are not rotated mid-session** (no ratchet yet).
 - Toy DH bounded to 512 bits **so it cannot be reused for real traffic**.
 
 Adversary classes covered: passive network observer, active MITM, authenticated-user
@@ -370,9 +401,13 @@ prober.
 
 | Check | Command / method | Result |
 |---|---|---|
-| Backend suite | `./mvnw -B clean test` (exit status captured) | **87/87, exit 0** |
+| Backend suite | `./mvnw -B clean test` (exit status captured) | **100/100, exit 0** |
 | Lint | `npm run lint` (oxlint) | **0 warnings, 0 errors, exit 0** |
-| Types + bundle | `npm run build` (`tsc -b` then vite) | **exit 0**, ~247 kB JS |
+| Frontend tests | `npm test` (vitest, Web Crypto layer) | **11/11, exit 0** |
+| Types + bundle | `npm run build` (`tsc -b` then vite) | **exit 0**, ~258 kB JS |
+| Prod boot without JWT_SECRET | `java -jar …` (H2 override, secret unset) | **exit 1**, "jwt-secret is not set…" |
+| Dev secret outside dev profile | `JWT_SECRET=dev-only-… java -jar …` | **exit 1**, "publicly known development default…" |
+| Dev profile boot (V2 migration) | `java -jar … --spring.profiles.active=dev` | health UP in 10 s |
 | Install reproducibility | `npm ci` from lockfile | exit 0, 0 vulnerabilities |
 | Live auth flow | register → login → `/auth/me` via dev proxy | 201 → 200 (JWT) → 200 |
 | Lab correctness | `POST /lab/hash {"input":"abc"}` | digest `ba7816bf…15ad` = correct NIST vector |
@@ -388,12 +423,12 @@ restore (`npm ci` / `./mvnw -DskipTests package` to rebuild).
 
 ## 14. Natural next steps (v2 candidates, in priority order)
 
-1. **Web Crypto in the browser** — real ECDH (P-256) → HKDF → AES-256-GCM in
-   `Messenger.tsx`, so the relay carries true end-to-end ciphertext. Server changes
-   needed: publish raw public keys (already stored), possibly key-confirmation messages.
-2. **Session ratchet** — rotate keys per message epoch for forward secrecy.
-3. **Push to GitHub** — makes the CI workflow actually run.
-4. **Messaging frontend tests** (currently lint/build only) and rate limiting.
+1. **Session ratchet** — rotate keys per message epoch for forward secrecy
+   (the ECDH handshake gives a good starting point for X3DH-style epochs).
+2. **Push to GitHub** — makes the CI workflow actually run.
+3. **Rate limiting / lockout on login+register** and TLS termination guidance.
+4. **Forced fingerprint confirmation UX** before the first message (close the
+   TOFU gap honestly).
 
 ---
 
@@ -406,6 +441,10 @@ restore (`npm ci` / `./mvnw -DskipTests package` to rebuild).
   `AuditTrailTest`.
 - Schema changes go through Flyway + `ddl-auto: validate`; never widen the schema to
   store key material (violates the central invariant).
+- `SessionTranscript` format and `frontend/src/lib/e2ee.ts` transcript builders are a
+  **wire protocol pair** — change them together or sessions break; bump `PREFIX` if the
+  format ever changes.
+- Keep the JWT secret policy (missing/short/dev-value refusals) intact; tests pin it.
 - Tests run on H2 — keep them container-free; CI depends on that.
 - Match existing style: records for DTOs, constructor injection, services own
   authorization, controllers own only HTTP binding.

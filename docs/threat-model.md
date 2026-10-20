@@ -41,24 +41,43 @@ out of band.
 - Cannot replay their own captured envelope → **400 REPLAYED_MESSAGE**
   (`replayIsRejectedWith400`). The unique index makes it unstorable.
 - Cannot relay on a `PENDING` or expired session → **409**.
+- Cannot anchor a handshake with a revoked, foreign, or mismatched
+  identity key → **400 INVALID_IDENTITY_KEY / HANDSHAKE_SIGNATURE_INVALID**
+  (`unusableIdentityKeyRejected`).
+- Cannot move an encrypted envelope to another sequence, sender,
+  conversation or session — the AAD is authenticated by the recipient's
+  GCM tag check (frontend `e2ee.test.ts`), so relocation fails closed.
 - Cannot revoke another user's key → **404** (`cannotRevokeForeignKey`).
 - Cannot activate a session they initiated → **409 NOT_RESPONDER**. A
   session needs two parties to exist.
 
 **A4 — Key-substitution / MITM attacker.** Controls the directory that maps
 users to public keys.
-*Defence:* fingerprints. The server recomputes
-`SHA-256(publicKeyBytes)` on publish — a client-supplied fingerprint would
-defeat the purpose. Users compare fingerprints out of band, a channel the
-attacker does not control. `MitmSimulation` demonstrates both outcomes: the
-identical attack succeeds unauthenticated and fails once signatures bind
-identities to ephemeral keys.
+*Defences, in depth:*
+- **Signatures over the handshake.** Each side signs the canonical session
+  transcript with its identity private key; the peer verifies against the
+  *published* key, and the server re-verifies before a session may exist or
+  become ACTIVE. A substituted ephemeral fails verification on both sides
+  (`MessagingFlowTest.substitutedEphemeralRejected`,
+  `signatureFromWrongKeyRejected`, `responderBadSignatureRejected`).
+- **Fingerprints.** The server recomputes `SHA-256(publicKeyBytes)` on
+  publish — a client-supplied fingerprint would defeat the purpose. Users
+  compare fingerprints out of band, a channel the attacker does not control.
+  *Limit, stated plainly:* this is **trust on first use** — if nobody
+  compares, a directory that lies at first contact still wins.
+- `MitmSimulation` demonstrates both outcomes pedagogically: the identical
+  attack succeeds unauthenticated and fails once signatures bind
+  identities to ephemeral keys.
 
 **A5 — Token forger.** Tries to mint a token without the signing secret.
-*Defences:* `alg=none` rejected before any crypto runs; signature compared
-in constant time; expiry checked after the signature (`JwtServiceTest`).
-The secret is refused at startup if under 32 characters, so a weak
-deployment cannot boot by accident.
+*Defences:* standard Nimbus JOSE+JWT verification — the `alg` is fixed to
+HS256 at decode time (`alg=none` and algorithm swaps are rejected by the
+library before any claim is read), signatures verify in constant time, and
+**issuer and expiry are validated** on every request (`JwtServiceTest`,
+12 tests). The secret is refused at startup when missing, blank, under 32
+characters, or equal to the publicly known development value outside the
+`dev` profile — proven both as unit tests and at the real launcher
+(`java -jar` exits 1 with an explanatory message).
 
 **A6 — Unauthenticated prober.** Enumerates endpoints.
 *Defence:* everything outside the three public zones answers **401
@@ -96,6 +115,14 @@ claimed but is honest as a stated limit:
 - **Tokens in `localStorage`.** Chosen so the JWT is inspectable in DevTools
   for teaching. An httpOnly cookie is the right call for a real deployment;
   the trade-off is CSRF, which then needs explicit handling.
+- **Identity private keys live in browser memory only.** They survive a
+  page reload only if the user exports/restores their own backup file.
+  Nothing sensitive is persisted to localStorage, the database, or logs —
+  the cost is UX: a lost backup means a new key and a new fingerprint your
+  contact must re-verify.
+- **Fingerprint verification is TOFU unless the app is used as instructed.**
+  The UI shows fingerprints and warns to compare out of band, but nothing
+  technically forces that comparison before the first message.
 
 ## Security-relevant trade-offs
 
@@ -105,7 +132,7 @@ claimed but is honest as a stated limit:
 | Identical login error for bad user vs bad password | Worse UX for typos | No username oracle |
 | Audit failures swallowed, not propagated | A broken audit table loses rows silently | A successful login must not become a 500 |
 | BCrypt cost 10 | ~100 ms per login | Deliberate: password hashing should be slow |
-| Hand-rolled JWT | We battle-tested it with 9 unit tests | In a *teaching* codebase, visible beats convenient |
+| Standard Nimbus JWT instead of hand-rolled | A teaching repo loses its visible base64url/HMAC walkthrough | The hand-rolled parser had a real claim-mangling flaw on exotic usernames; a vetted library beats bespoke code for token formats |
 | Toy DH bounded to 512 bits | Cannot be reused for real traffic | Intentional — the bound is the safeguard |
 
 ## What an attacker learns from any single response

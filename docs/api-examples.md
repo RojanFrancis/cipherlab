@@ -174,7 +174,10 @@ curl -s -X POST localhost:8080/api/v1/identity/keys \
 
 The fingerprint is `SHA-256(publicKeyBytes)` in hex, **recomputed
 server-side** — a client-supplied fingerprint would defeat the purpose.
-Publishing a second key returns `keyVersion: 2`; rotation keeps history so
+The submitted material is **parsed and validated**: `EC_P256` must be a
+real NIST P-256 SubjectPublicKeyInfo and `RSA_2048` a 2048-bit RSA key;
+random bytes are rejected with `400 INVALID_KEY`. Publishing a second key
+returns `keyVersion: 2`; rotation keeps history so
 old signatures stay verifiable. Revocation sets `revokedAt` and never
 deletes the row.
 
@@ -188,7 +191,15 @@ curl -s localhost:8080/api/v1/identity/users/$USER_ID/keys -H "Authorization: Be
 
 ## Messaging
 
-### Create a conversation and a session
+### Create a conversation and run the signed handshake
+
+Session creation carries the initiator's **signed ephemeral public key**.
+The session id is client-generated so both parties can sign the same
+canonical transcript
+(`cipherlab-session-v1|sid|conv|init|resp|suite|A:ephA`), and the signature
+is ECDSA P-256 with the caller's identity private key (done for you by the
+UI; shown here as curl with `$SIG_A` = Base64 DER, `$EPH_A` = Base64 SPKI,
+`$KEY_A` = the caller's published identity key id):
 
 ```bash
 curl -s -X POST localhost:8080/api/v1/conversations \
@@ -198,8 +209,17 @@ curl -s -X POST localhost:8080/api/v1/conversations \
 
 curl -s -X POST localhost:8080/api/v1/conversations/$CONV/sessions \
   -H "Authorization: Bearer $ALICE" -H 'Content-Type: application/json' \
-  -d '{"suite":"X25519+HKDF-SHA256+AES-256-GCM"}'
-# {"id":"b3dca0b4-…","status":"PENDING","expiresAt":null}
+  -d "{\"sessionId\":\"$SID\",\"suite\":\"EC_P256+HKDF-SHA256+AES-256-GCM\",\"ephemeralPublic\":\"$EPH_A\",\"signature\":\"$SIG_A\",\"identityKeyId\":\"$KEY_A\"}"
+# {"id":"$SID","status":"PENDING","initiatorEphemeralPublic":"$EPH_A",…}
+```
+
+The server verifies `$SIG_A` against the caller's registered (non-revoked)
+identity key **before** the session exists — a substituted ephemeral or a
+signature from another key answers `400 HANDSHAKE_SIGNATURE_INVALID`.
+The responder discovers the pending session with:
+
+```bash
+curl -s localhost:8080/api/v1/conversations/$CONV/sessions -H "Authorization: Bearer $BOB"
 ```
 
 Relaying before activation is refused — the lifecycle is enforced:
@@ -208,18 +228,28 @@ Relaying before activation is refused — the lifecycle is enforced:
 { "code": "SESSION_NOT_ACTIVE", "message": "Session must be ACTIVE before relaying messages.", "traceId": "..." }
 ```
 
-Only the responder can activate; the initiator gets **409 NOT_RESPONDER**:
+Only the responder can activate, and only **with their own signed
+ephemeral** over the full transcript (now including both ephemerals); the
+initiator gets **409 NOT_RESPONDER**:
 
 ```bash
 curl -s -X POST localhost:8080/api/v1/sessions/$SESSION/activate \
-  -H "Authorization: Bearer $BOB"
-# {"id":"b3dca0b4-…","status":"ACTIVE","expiresAt":"2026-10-21T05:59:14"}
+  -H "Authorization: Bearer $BOB" -H 'Content-Type: application/json' \
+  -d "{\"ephemeralPublic\":\"$EPH_B\",\"signature\":\"$SIG_B\",\"identityKeyId\":\"$KEY_B\"}"
+# {"id":"b3dca0b4-…","status":"ACTIVE","transcriptHash":"…","expiresAt":"2026-10-21T05:59:14"}
 ```
+
+Both clients then derive two directional AES-256-GCM keys locally with
+HKDF-SHA-256 (context-separated `a2b`/`b2a` info labels over the full
+transcript). The server never sees ECDH output — only these public values.
 
 ### Relay ciphertext, then replay it
 
+Structural rules: nonce must Base64-decode to exactly 12 bytes (96-bit GCM
+nonce); ciphertext to at least 16 bytes (it must carry the tag):
+
 ```bash
-ENVELOPE='{"sequenceNumber":7,"nonce":"AAAAAAAAAAAAAAAA","ciphertext":"aGVsbG8gY2lwaGVybGFi"}'
+ENVELOPE='{"sequenceNumber":7,"nonce":"AAAAAAAAAAAAAAAA","ciphertext":"YWJjZGVmZ2hpamtsbW5vcHFyc3R1dnc="}'
 
 curl -s -X POST localhost:8080/api/v1/sessions/$SESSION/messages \
   -H "Authorization: Bearer $ALICE" -H 'Content-Type: application/json' -d "$ENVELOPE"
@@ -255,5 +285,5 @@ History returns envelopes only:
 
 ```json
 [ { "id": "8e4ca2bf-…", "sequenceNumber": 7, "nonce": "AAAAAAAAAAAAAAAA",
-    "ciphertext": "aGVsbG8gY2lwaGVybGFi", "senderId": "c17ea55c-…", "createdAt": "…" } ]
+    "ciphertext": "YWJjZGVmZ2hpamtsbW5vcHFyc3R1dnc=", "senderId": "c17ea55c-…", "createdAt": "…" } ]
 ```

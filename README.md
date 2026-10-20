@@ -16,10 +16,10 @@ React + TypeScript frontend and PostgreSQL.
 |--------------|--------------------------------------------------------------|
 | Backend      | Java 21, Spring Boot 4, Maven                                |
 | API          | REST (`/api/v1`), Bean Validation                            |
-| Security     | Spring Security, hand-rolled HS256 JWT, BCrypt               |
+| Security     | Spring Security OAuth2 resource server (Nimbus HS256 + iss/exp), BCrypt |
 | Persistence  | Spring Data JPA, PostgreSQL 17, Flyway                       |
 | Frontend     | React 19, TypeScript, Vite                                   |
-| Testing      | JUnit 5, MockMvc over the real filter chain, 87 tests        |
+| Testing      | JUnit 5 (100 tests) + vitest (11), MockMvc over the real filter chain |
 | Delivery     | Docker Compose, GitHub Actions CI                            |
 
 ## Repository layout
@@ -29,7 +29,7 @@ cipherlab/
 ├── backend/          # Spring Boot API (Maven wrapper committed)
 │   └── src/main/java/com/rojan/cipherlab/
 │       ├── crypto/       # AES-GCM, SHA-2/HMAC, HKDF, ECDSA, toy DH, MITM sim
-│       ├── security/     # JWT service, bearer filter, 401/403 bodies
+│       ├── security/     # Nimbus JWT service + decoder policy, 401/403 bodies
 │       ├── auth/         # register / login / me
 │       ├── identity/     # public key registry + fingerprints
 │       ├── messaging/    # conversations → sessions → ciphertext relay
@@ -83,7 +83,8 @@ Set `JWT_SECRET` (min 32 chars) in production; the app refuses to boot without a
 ## Running the tests
 
 ```bash
-cd backend && ./mvnw test      # 87 tests
+cd backend && ./mvnw test      # 100 tests
+cd frontend && npm test         # 11 vitest tests (Web Crypto E2EE layer)
 cd frontend && npm run build   # tsc -b && vite build
 ```
 
@@ -104,17 +105,34 @@ not test doubles.
 | Signatures | Verify the original, watch the tampered copy fail |
 | MITM | The same attack succeeds unauthenticated and dies with signatures |
 
-**Secure messaging** — register/login (BCrypt), identity keys with server-computed
-fingerprints, conversations, a two-party session lifecycle (`PENDING` → `ACTIVE`), and a
-ciphertext relay with server-side replay rejection.
+**Secure messaging** — register/login (BCrypt), identity keys with
+server-computed fingerprints and **parsed key-material validation**, conversations,
+and a two-party session handshake: each side contributes a browser-generated
+ephemeral P-256 key signed with its identity key over a canonical transcript
+(verified by the peer *and* the server before `ACTIVE`), then derives
+directional AES-256-GCM keys locally with HKDF-SHA-256. The relay stores
+only ciphertext, nonces and replay-tracking metadata. Messages carry a
+fresh 96-bit nonce and bind `sessionId|conversationId|senderId|sequence`
+as additional authenticated data; tampered, relocated or replayed
+envelopes are rejected.
 
 **Security behaviour**, each pinned by a test:
 
 - Replay of a captured envelope → `400 REPLAYED_MESSAGE`, detected by the
   `(session, sender, sequence)` unique index **without decrypting anything**.
+- A substituted ephemeral key, a signature from the wrong identity key, or
+  a revoked/foreign identity key → `400 HANDSHAKE_SIGNATURE_INVALID` /
+  `INVALID_IDENTITY_KEY` — verified server-side, and the peer client
+  re-verifies the initiator's signature before contributing its own key.
+- An encrypted envelope moved to another sequence, sender, conversation or
+  session fails the recipient's GCM authentication (AAD binding).
 - Non-members get `404`, never `403` — membership is not probe-able.
 - Wrong password and unknown username return the **identical** `401` body — no username oracle.
-- `alg=none` and tampered JWTs are rejected before any claim is trusted.
+- Tokens are verified by the standard Nimbus stack: signature, **issuer**
+  and expiry; `alg=none` and swapped algorithms are rejected by the library.
+- The app **refuses to boot** without an explicit `JWT_SECRET`, with a
+  secret under 32 chars, or with the publicly known dev secret outside the
+  `dev` profile.
 - Password hashes never appear in any response; audit rows carry no secrets.
 - Every error, including 401/403 from the filter chain, uses one `{code, message, traceId}` shape.
 
@@ -152,6 +170,10 @@ Stated plainly rather than papered over — each is listed as a non-goal in the 
 - **No TLS, rate limiting, or account lockout.** Required in any real deployment.
 - **Two-party sessions only.** The replay constraint is correct for two senders, not groups.
 - **Tokens in `localStorage`.** Chosen so the JWT is inspectable in DevTools for teaching.
-- **The messenger UI shows a Base64 envelope, not Web Crypto.** The server-side relay
-  contract is what the UI demonstrates; client-side ECDH + HKDF + AES-GCM in the browser
-  is the natural next milestone.
+- **Identity private keys live in browser memory only**, with a user-held
+  backup file for restore — never localStorage, never the server. A lost
+  backup means a new identity fingerprint your contact must re-verify.
+- **Fingerprint verification is trust-on-first-use** unless users compare
+  out of band as the UI instructs; nothing technically forces the comparison.
+- **Client-side encryption keys are never rotated mid-session** (no ratchet);
+  a ratchet is the natural v2.

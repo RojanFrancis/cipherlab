@@ -56,6 +56,12 @@ jobs:
         working-directory: frontend
         run: npm run lint
 
+      # Web Crypto unit tests for the messaging E2EE layer (vitest):
+      # handshake signatures, directional keys, HKDF separation, AAD, tampering.
+      - name: Frontend tests
+        working-directory: frontend
+        run: npm test
+
       # `npm run build` runs `tsc -b` first, so a type error fails the job
       # before Vite ever bundles.
       - name: Type-check and build
