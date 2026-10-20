@@ -1,13 +1,10 @@
 package com.rojan.cipherlab.identity;
 
-import java.security.AlgorithmParameters;
 import java.security.GeneralSecurityException;
 import java.security.KeyFactory;
 import java.security.PublicKey;
-import java.security.interfaces.ECPublicKey;
 import java.security.interfaces.RSAPublicKey;
-import java.security.spec.ECGenParameterSpec;
-import java.security.spec.ECParameterSpec;
+import java.security.spec.RSAPublicKeySpec;
 import java.security.spec.X509EncodedKeySpec;
 import java.util.Base64;
 import java.util.List;
@@ -22,6 +19,7 @@ import com.rojan.cipherlab.common.ConflictException;
 import com.rojan.cipherlab.common.InvalidRequestException;
 import com.rojan.cipherlab.common.NotFoundException;
 import com.rojan.cipherlab.crypto.hashing.HashingService;
+import com.rojan.cipherlab.crypto.keyexchange.P256Keys;
 
 /**
  * Public identity key registry.
@@ -108,16 +106,7 @@ public class IdentityKeyService {
     private static void validateKeyMaterial(String keyType, byte[] der) {
         try {
             switch (keyType) {
-                case "EC_P256" -> {
-                    PublicKey publicKey = KeyFactory.getInstance("EC")
-                            .generatePublic(new X509EncodedKeySpec(der));
-                    if (!(publicKey instanceof ECPublicKey ecKey)) {
-                        throw invalidKey("publicKey is not an EC public key.");
-                    }
-                    if (!isNistP256(ecKey.getParams())) {
-                        throw invalidKey("EC identity keys must use the NIST P-256 (secp256r1) curve.");
-                    }
-                }
+                case "EC_P256" -> P256Keys.parseSpki(der);
                 case "RSA_2048" -> {
                     PublicKey publicKey = KeyFactory.getInstance("RSA")
                             .generatePublic(new X509EncodedKeySpec(der));
@@ -135,24 +124,6 @@ public class IdentityKeyService {
         } catch (GeneralSecurityException e) {
             throw invalidKey("publicKey is not a valid X.509 SubjectPublicKeyInfo for "
                     + keyType + ".");
-        }
-    }
-
-    /**
-     * Curve check by identity of the standard parameters: P-256's group order
-     * and generator are its fingerprint. (ECCurve does not override equals,
-     * so order + generator + field size is the reliable comparison.)
-     */
-    private static boolean isNistP256(ECParameterSpec params) {
-        try {
-            AlgorithmParameters algorithmParameters = AlgorithmParameters.getInstance("EC");
-            algorithmParameters.init(new ECGenParameterSpec("secp256r1"));
-            ECParameterSpec reference = algorithmParameters.getParameterSpec(ECParameterSpec.class);
-            return params.getCurve().getField().getFieldSize() == 256
-                    && params.getOrder().equals(reference.getOrder())
-                    && params.getGenerator().equals(reference.getGenerator());
-        } catch (GeneralSecurityException e) {
-            return false;
         }
     }
 

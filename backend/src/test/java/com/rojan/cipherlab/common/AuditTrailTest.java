@@ -1,10 +1,20 @@
 package com.rojan.cipherlab.common;
 
+import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
 
+import java.nio.charset.StandardCharsets;
+import java.security.KeyPair;
+import java.security.KeyPairGenerator;
+import java.security.PrivateKey;
+import java.security.Signature;
+import java.security.spec.ECGenParameterSpec;
+import java.util.Base64;
 import java.util.List;
 import java.util.UUID;
+
+import com.rojan.cipherlab.messaging.SessionTranscript;
 
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -54,6 +64,35 @@ class AuditTrailTest {
                 .andReturn();
         return objectMapper.readTree(login.getResponse().getContentAsString())
                 .get("accessToken").asText();
+    }
+
+    // ------------------------------------------- handshake helpers (same as the browser does)
+
+    private static KeyPair newP256() throws Exception {
+        KeyPairGenerator generator = KeyPairGenerator.getInstance("EC");
+        generator.initialize(new ECGenParameterSpec("secp256r1"));
+        return generator.generateKeyPair();
+    }
+
+    private static String spkiOf(KeyPair pair) {
+        return Base64.getEncoder().encodeToString(pair.getPublic().getEncoded());
+    }
+
+    private static String sign(PrivateKey privateKey, String transcript) throws Exception {
+        Signature signer = Signature.getInstance("SHA256withECDSA");
+        signer.initSign(privateKey);
+        signer.update(transcript.getBytes(StandardCharsets.UTF_8));
+        return Base64.getEncoder().encodeToString(signer.sign());
+    }
+
+    private String publishIdentityKey(String token, KeyPair pair) throws Exception {
+        MvcResult result = mockMvc.perform(post("/api/v1/identity/keys")
+                        .header("Authorization", "Bearer " + token)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"keyType\":\"EC_P256\",\"publicKey\":\"" + spkiOf(pair) + "\"}"))
+                .andExpect(status().isCreated())
+                .andReturn();
+        return objectMapper.readTree(result.getResponse().getContentAsString()).get("id").asText();
     }
 
     @Test
@@ -107,19 +146,45 @@ class AuditTrailTest {
         String conversationId = objectMapper.readTree(conv.getResponse().getContentAsString())
                 .get("id").asText();
 
-        MvcResult sess = mockMvc.perform(post("/api/v1/conversations/" + conversationId + "/sessions")
+        // The owner's user id (needed for the canonical transcript).
+        MvcResult me = mockMvc.perform(get("/api/v1/auth/me")
+                        .header("Authorization", "Bearer " + token))
+                .andExpect(status().isOk())
+                .andReturn();
+        String ownerId = objectMapper.readTree(me.getResponse().getContentAsString()).get("id").asText();
+
+        // Real handshake: both sides publish identity keys and sign the transcript.
+        KeyPair ownerKeys = newP256();
+        String ownerKeyId = publishIdentityKey(token, ownerKeys);
+        KeyPair partnerKeys = newP256();
+        String partnerKeyId = publishIdentityKey(partnerToken, partnerKeys);
+
+        UUID sessionId = UUID.randomUUID();
+        String ephA = spkiOf(newP256());
+        String transcriptA = SessionTranscript.initiatorForm(sessionId, UUID.fromString(conversationId),
+                UUID.fromString(ownerId), UUID.fromString(partnerId), SessionTranscript.SUITE, ephA);
+        mockMvc.perform(post("/api/v1/conversations/" + conversationId + "/sessions")
                         .header("Authorization", "Bearer " + token)
                         .contentType(MediaType.APPLICATION_JSON)
-                        .content("{\"suite\":\"X25519+HKDF-SHA256+AES-256-GCM\"}"))
-                .andExpect(status().isCreated())
-                .andReturn();
-        String sessionId = objectMapper.readTree(sess.getResponse().getContentAsString())
-                .get("id").asText();
+                        .content("{\"sessionId\":\"" + sessionId + "\",\"suite\":\"" + SessionTranscript.SUITE
+                                + "\",\"ephemeralPublic\":\"" + ephA + "\",\"signature\":\""
+                                + sign(ownerKeys.getPrivate(), transcriptA)
+                                + "\",\"identityKeyId\":\"" + ownerKeyId + "\"}"))
+                .andExpect(status().isCreated());
+
+        String ephB = spkiOf(newP256());
+        String transcriptFull = SessionTranscript.fullForm(sessionId, UUID.fromString(conversationId),
+                UUID.fromString(ownerId), UUID.fromString(partnerId), SessionTranscript.SUITE, ephA, ephB);
         mockMvc.perform(post("/api/v1/sessions/" + sessionId + "/activate")
-                        .header("Authorization", "Bearer " + partnerToken))
+                        .header("Authorization", "Bearer " + partnerToken)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"ephemeralPublic\":\"" + ephB + "\",\"signature\":\""
+                                + sign(partnerKeys.getPrivate(), transcriptFull)
+                                + "\",\"identityKeyId\":\"" + partnerKeyId + "\"}"))
                 .andExpect(status().isOk());
 
-        String envelope = "{\"sequenceNumber\":3,\"nonce\":\"AAAAAAAAAAAAAAAA\",\"ciphertext\":\"aGVsbG8=\"}";
+        String envelope = "{\"sequenceNumber\":3,\"nonce\":\"AAAAAAAAAAAAAAAA\",\"ciphertext\":\""
+                + Base64.getEncoder().encodeToString(new byte[32]) + "\"}";
         mockMvc.perform(post("/api/v1/sessions/" + sessionId + "/messages")
                         .header("Authorization", "Bearer " + token)
                         .contentType(MediaType.APPLICATION_JSON)

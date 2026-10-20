@@ -67,7 +67,9 @@ public class MessagingController {
             @PathVariable UUID conversationId,
             @Valid @RequestBody CreateSessionRequest request) {
         return ResponseEntity.status(HttpStatus.CREATED)
-                .body(messagingService.createSession(principal.userId(), conversationId, request.suite()));
+                .body(messagingService.createSession(principal.userId(), conversationId,
+                        request.suite(), request.sessionId(), request.ephemeralPublic(),
+                        request.signature(), request.identityKeyId()));
     }
 
     @GetMapping("/sessions/{sessionId}")
@@ -80,8 +82,10 @@ public class MessagingController {
     @PostMapping("/sessions/{sessionId}/activate")
     public MessagingService.SessionResponse activateSession(
             @AuthenticationPrincipal AuthenticatedUser principal,
-            @PathVariable UUID sessionId) {
-        return messagingService.activateSession(principal.userId(), sessionId);
+            @PathVariable UUID sessionId,
+            @Valid @RequestBody ActivateSessionRequest request) {
+        return messagingService.activateSession(principal.userId(), sessionId,
+                request.ephemeralPublic(), request.signature(), request.identityKeyId());
     }
 
     // ---------------------------------------------------------------- relay
@@ -101,13 +105,37 @@ public class MessagingController {
     public record CreateConversationRequest(@NotNull UUID partnerId) {
     }
 
+    /**
+     * Session creation carries the initiator's <b>signed ephemeral</b>:
+     * {@code sessionId} is client-generated so both parties can sign the
+     * same canonical transcript; {@code signature} is ECDSA P-256 over that
+     * transcript with the caller's identity private key; {@code identityKeyId}
+     * names the registered public key the server verifies against.
+     */
     public record CreateSessionRequest(
+            @NotNull UUID sessionId,
             @NotBlank @Size(max = 64)
-            @Pattern(regexp = "X25519\\+HKDF-SHA256\\+AES-256-GCM|EC_P256\\+HKDF-SHA256\\+AES-256-GCM|TOY_DH\\+HKDF-SHA256\\+AES-256-GCM",
-                    message = "must be a supported suite label")
-            String suite) {
+            @Pattern(regexp = "EC_P256\\+HKDF-SHA256\\+AES-256-GCM",
+                    message = "must be the supported suite label")
+            String suite,
+            @NotBlank @Size(max = 256) String ephemeralPublic,
+            @NotBlank @Size(max = 256) String signature,
+            @NotNull UUID identityKeyId) {
     }
 
+    /** Activation carries the responder's signed ephemeral (same rules). */
+    public record ActivateSessionRequest(
+            @NotBlank @Size(max = 256) String ephemeralPublic,
+            @NotBlank @Size(max = 256) String signature,
+            @NotNull UUID identityKeyId) {
+    }
+
+    /**
+     * The relay envelope. Nonce must be a 96-bit GCM nonce (12 bytes
+     * Base64); ciphertext carries the AES-GCM result with its 16-byte tag
+     * (Base64 of at least 16 decoded bytes, at most 48 KiB). The server
+     * checks structure only — it has no key and cannot inspect content.
+     */
     public record RelayRequest(
             @NotNull @PositiveOrZero Long sequenceNumber,
             @NotBlank @Size(max = 64) String nonce,
