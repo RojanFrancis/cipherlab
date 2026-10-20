@@ -16,6 +16,14 @@ server:
   port: 8080
   shutdown: graceful
 
+cipherlab:
+  security:
+    # HS256 signing secret for access tokens (min 32 chars; the app refuses
+    # to start without one). Override via JWT_SECRET in real deployments —
+    # the dev default below is intentionally weak and public.
+    jwt-secret: ${JWT_SECRET:dev-only-jwt-secret-do-not-use-in-production-0123456789}
+    jwt-ttl-seconds: ${JWT_TTL_SECONDS:3600}
+
 management:
   endpoints:
     web:

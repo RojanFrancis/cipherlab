@@ -51,16 +51,30 @@ public class MitmSimulation {
         }
         boolean unauthenticated = UNAUTHENTICATED.equals(mode);
 
-        // Deterministic-ish fresh private values (1 < x < 22 for p = 23)
+        // Fresh private values (1 < x < 22 for p = 23). Mallory's two
+        // ephemeral exponents are drawn until her two substituted sessions
+        // are distinct: the narrative requires Alice and Bob to hold
+        // *different* keys (both Mallory's). With a 22-element group a
+        // collision is ~1/22 likely per draw, so we loop rather than leave
+        // the story's central invariant to chance.
         int a = 2 + RANDOM.nextInt(18);  // Alice
         int b = 2 + RANDOM.nextInt(18);  // Bob
-        int m = 2 + RANDOM.nextInt(18);  // Mallory (her two ephemeral keys)
-        int n = 2 + RANDOM.nextInt(18);
-
+        int m;
+        int n;
         BigInteger aliceReal = G.modPow(BigInteger.valueOf(a), P);   // A
         BigInteger bobReal = G.modPow(BigInteger.valueOf(b), P);     // B
-        BigInteger malloryA = G.modPow(BigInteger.valueOf(m), P);    // A' sent to Bob
-        BigInteger malloryB = G.modPow(BigInteger.valueOf(n), P);    // B' sent to Alice
+        BigInteger malloryA;
+        BigInteger malloryB;
+        BigInteger aliceSeesMallory;
+        BigInteger bobSeesMallory;
+        do {
+            m = 2 + RANDOM.nextInt(18);  // Mallory's key toward Bob
+            n = 2 + RANDOM.nextInt(18);  // Mallory's key toward Alice
+            malloryA = G.modPow(BigInteger.valueOf(m), P);    // A' sent to Bob
+            malloryB = G.modPow(BigInteger.valueOf(n), P);    // B' sent to Alice
+            aliceSeesMallory = malloryB.modPow(BigInteger.valueOf(a), P); // s(Alice,Mallory)
+            bobSeesMallory = malloryA.modPow(BigInteger.valueOf(b), P);   // s(Bob,Mallory)
+        } while (aliceSeesMallory.equals(bobSeesMallory));
 
         Map<String, String> secrets = new LinkedHashMap<>();
         List<String> steps;
@@ -68,8 +82,6 @@ public class MitmSimulation {
         boolean substitutionDetected;
 
         if (unauthenticated) {
-            BigInteger aliceSeesMallory = malloryB.modPow(BigInteger.valueOf(a), P); // s(Alice,Mallory)
-            BigInteger bobSeesMallory = malloryA.modPow(BigInteger.valueOf(b), P);   // s(Bob,Mallory)
             BigInteger malloryWithAlice = aliceReal.modPow(BigInteger.valueOf(n), P);
             BigInteger malloryWithBob = bobReal.modPow(BigInteger.valueOf(m), P);
             // Mallory's two ends must agree with her counterparts:
@@ -98,7 +110,6 @@ public class MitmSimulation {
             // Authenticated: public values carry signatures from the claimed sender's
             // identity key. Mallory can re-encrypt (sign with her own key) — but the
             // verifier checks against ALICE's registered public key, so it fails.
-            BigInteger aliceSeesMallory = malloryB.modPow(BigInteger.valueOf(a), P);
             BigInteger bobTrustedAlice = aliceReal.modPow(BigInteger.valueOf(b), P); // no substitution happened
             secrets.put("alice ↔ bob", bobTrustedAlice.toString() + " (authenticated)");
             secrets.put("alice ↔ mallory", "no — substitution rejected before derivation");

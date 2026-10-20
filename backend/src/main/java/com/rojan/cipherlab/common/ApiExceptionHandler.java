@@ -65,6 +65,27 @@ public class ApiExceptionHandler {
         return new ApiError("INVALID_REQUEST", message, traceId());
     }
 
+    /** Credentials presented but rejected. Same body for unknown user and bad password. */
+    @ExceptionHandler(UnauthorizedException.class)
+    @ResponseStatus(HttpStatus.UNAUTHORIZED)
+    public ApiError unauthorized(UnauthorizedException ex) {
+        return new ApiError("INVALID_CREDENTIALS", ex.getMessage(), traceId());
+    }
+
+    /** Missing, deleted, or not-yours resource — 404 never distinguishes the two. */
+    @ExceptionHandler(NotFoundException.class)
+    @ResponseStatus(HttpStatus.NOT_FOUND)
+    public ApiError notFound(NotFoundException ex) {
+        return new ApiError("NOT_FOUND", ex.getMessage(), traceId());
+    }
+
+    /** State conflict: duplicate identity, invalid session status transition. */
+    @ExceptionHandler(ConflictException.class)
+    @ResponseStatus(HttpStatus.CONFLICT)
+    public ApiError conflict(ConflictException ex) {
+        return new ApiError(ex.getCode(), ex.getMessage(), traceId());
+    }
+
     /** Unparseable JSON body. */
     @ExceptionHandler(HttpMessageNotReadableException.class)
     @ResponseStatus(HttpStatus.BAD_REQUEST)
