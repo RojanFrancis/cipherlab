@@ -1,173 +1,146 @@
 package com.rojan.cipherlab.security;
 
 import java.nio.charset.StandardCharsets;
-import java.security.MessageDigest;
 import java.time.Instant;
-import java.util.Base64;
+import java.util.Date;
 import java.util.UUID;
-import java.util.regex.Matcher;
-import java.util.regex.Pattern;
-
-import javax.crypto.Mac;
-import javax.crypto.spec.SecretKeySpec;
 
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.security.oauth2.jwt.JwtDecoder;
+import org.springframework.security.oauth2.jwt.JwtValidators;
+import org.springframework.security.oauth2.jwt.NimbusJwtDecoder;
 import org.springframework.stereotype.Service;
 
+import com.nimbusds.jose.JWSAlgorithm;
+import com.nimbusds.jose.JWSHeader;
+import com.nimbusds.jose.crypto.MACSigner;
+import com.nimbusds.jwt.JWTClaimsSet;
+import com.nimbusds.jwt.SignedJWT;
+
+import javax.crypto.spec.SecretKeySpec;
+
 /**
- * Minimal, self-contained HMAC-SHA256 JWT implementation (RFC 7519 + RFC 7515).
+ * Access-token <b>issuance</b> built on the standard Nimbus JOSE+JWT library
+ * (via Spring Security's OAuth2 stack) — no hand-rolled parsing, header
+ * handling or claim extraction anywhere in this codebase.
  *
- * <p>Hand-rolled on purpose: for a cryptography learning lab, every step of
- * token construction — base64url segments, the {@code HMAC(header.payload)}
- * signature, the verification order — is visible and auditable, rather than
- * hidden behind a dependency. The primitives used are exactly the JCA ones
- * taught in the lab ({@link Mac} with {@code HmacSHA256}).
+ * <p><b>Token verification</b> is equally standard: {@link #createDecoder()}
+ * produces the {@link JwtDecoder} that {@code SecurityConfig} installs into
+ * Spring Security's resource-server filter. That decoder enforces, per
+ * request: HS256 signature (algorithm-confusion and {@code alg=none} are
+ * rejected by the library itself), <b>issuer</b>, and <b>expiry</b> — in
+ * that trust order, before any claim is acted upon.
  *
- * <p><b>Security properties enforced here:</b>
+ * <p><b>Secret policy</b> (fail-fast at startup, in every profile):
  * <ul>
- *   <li><b>Algorithm confusion is impossible</b> — the {@code alg} header is
- *       verified to be exactly {@code HS256}; {@code none} or swapped
- *       algorithms are rejected before any crypto runs. (The classic
- *       {@code alg=none} attack.)</li>
- *   <li><b>Constant-time signature comparison</b> — {@link MessageDigest#isEqual}
- *       avoids the timing side channel of {@code String.equals} on MACs.</li>
- *   <li><b>Expiry is checked</b> — an expired token is rejected even when the
- *       signature is valid.</li>
- *   <li><b>The secret never appears in tokens or logs</b>; it is injected via
- *       configuration ({@code JWT_SECRET}) and read once at startup.</li>
+ *   <li>missing/blank → {@link IllegalStateException}: production cannot boot
+ *       without {@code JWT_SECRET};</li>
+ *   <li>shorter than 32 characters → refused (HS256's minimum key size);</li>
+ *   <li>the well-known public development value → refused unless the active
+ *       profile explicitly allows it ({@code cipherlab.security.allow-dev-secret},
+ *       set only in {@code application-dev.yml}). A publicly known secret is
+ *       no secret: anyone could mint tokens for any user.</li>
  * </ul>
  *
- * <p>A token is three base64url segments: {@code header.payload.signature}.
- * Clients must treat it as opaque; only the signature makes the claims
- * trustworthy — unsigned claims are just attacker-editable JSON.
+ * <p>The secret is read once at startup and never logged, echoed or embedded
+ * in any response. Tokens carry {@code sub} (user id), {@code username},
+ * {@code iss}, {@code iat}, {@code exp}.
  */
 @Service
 public class JwtService {
 
-    private static final String ALGORITHM = "HmacSHA256";
-    private static final String ALG_HEADER = "HS256";
-    private static final Base64.Encoder B64 = Base64.getUrlEncoder().withoutPadding();
-    private static final Base64.Decoder B64_DECODER = Base64.getUrlDecoder();
+    /**
+     * The historical development default. It is intentionally left public so
+     * that its presence anywhere outside the dev profile can be detected and
+     * refused — a known signing key means forgable tokens.
+     */
+    public static final String KNOWN_DEV_SECRET =
+            "dev-only-jwt-secret-do-not-use-in-production-0123456789";
 
-    /** header.payload.signature — no dots anywhere else. */
-    private static final Pattern TOKEN_FORMAT =
-            Pattern.compile("^([A-Za-z0-9_-]+)\\.([A-Za-z0-9_-]+)\\.([A-Za-z0-9_-]+)$");
-
-    private static final String HEADER_JSON = "{\"alg\":\"" + ALG_HEADER + "\",\"typ\":\"JWT\"}";
+    public static final int MIN_SECRET_LENGTH = 32;
 
     private final SecretKeySpec key;
+    private final String issuer;
     private final long ttlSeconds;
 
     public JwtService(@Value("${cipherlab.security.jwt-secret}") String secret,
-                      @Value("${cipherlab.security.jwt-ttl-seconds:3600}") long ttlSeconds) {
-        if (secret == null || secret.length() < 32) {
-            throw new IllegalStateException(
-                    "cipherlab.security.jwt-secret must be at least 32 characters; set JWT_SECRET");
-        }
-        this.key = new SecretKeySpec(secret.getBytes(StandardCharsets.UTF_8), ALGORITHM);
+                      @Value("${cipherlab.security.jwt-issuer}") String issuer,
+                      @Value("${cipherlab.security.jwt-ttl-seconds:3600}") long ttlSeconds,
+                      @Value("${cipherlab.security.allow-dev-secret:false}") boolean allowDevSecret) {
+        validateSecret(secret, allowDevSecret);
+        this.key = new SecretKeySpec(secret.getBytes(StandardCharsets.UTF_8), "HmacSHA256");
+        this.issuer = issuer;
         this.ttlSeconds = ttlSeconds;
     }
 
     /**
-     * Issue a signed token for a user. Claims: {@code sub} (user id),
-     * {@code username}, {@code iat}, {@code exp} — all epoch seconds.
+     * Startup policy, also invoked directly by the {@code JwtDecoder} bean so
+     * both halves of the pipeline agree. Throws {@link IllegalStateException}
+     * (failing application startup) when the secret is unusable.
      */
-    public String issueToken(UUID userId, String username) {
-        long now = Instant.now().getEpochSecond();
-        String header = B64.encodeToString(HEADER_JSON.getBytes(StandardCharsets.UTF_8));
-        String payload = B64.encodeToString(("{\"sub\":\"" + userId
-                + "\",\"username\":\"" + jsonEscape(username)
-                + "\",\"iat\":" + now + ",\"exp\":" + (now + ttlSeconds) + "}")
-                .getBytes(StandardCharsets.UTF_8));
-        return header + "." + payload + "." + B64.encodeToString(hmac(header + "." + payload));
+    public static void validateSecret(String secret, boolean allowDevSecret) {
+        if (secret == null || secret.isBlank()) {
+            throw new IllegalStateException(
+                    "cipherlab.security.jwt-secret is not set. Set JWT_SECRET (min 32 random chars); "
+                            + "the application refuses to run without an explicit signing secret.");
+        }
+        if (secret.length() < MIN_SECRET_LENGTH) {
+            throw new IllegalStateException(
+                    "cipherlab.security.jwt-secret must be at least " + MIN_SECRET_LENGTH
+                            + " characters (HS256 minimum key size); set JWT_SECRET.");
+        }
+        if (!allowDevSecret && KNOWN_DEV_SECRET.equals(secret)) {
+            throw new IllegalStateException(
+                    "cipherlab.security.jwt-secret is the publicly known development default. "
+                            + "Outside the dev profile this is refused: anyone holding it could mint "
+                            + "tokens for any user. Set a fresh JWT_SECRET.");
+        }
     }
 
     /**
-     * Verify a token and return its claims, or {@code null} if the token is
-     * malformed, tampered with, uses the wrong algorithm, or has expired.
-     *
-     * <p>Verification order matters: format → alg → signature → expiry. The
-     * signature is checked <em>before</em> the claims are trusted for
-     * anything, and expiry is checked after — a forged exp claim cannot
-     * survive a bad signature.
+     * Issue a signed token for a user. Claims: {@code sub} (user id),
+     * {@code username}, {@code iss}, {@code iat}, {@code exp}.
      */
-    public Claims verify(String token) {
-        if (token == null) {
-            return null;
-        }
-        Matcher matcher = TOKEN_FORMAT.matcher(token);
-        if (!matcher.matches()) {
-            return null;
-        }
-        String headerSegment = matcher.group(1);
-        String payloadSegment = matcher.group(2);
-        byte[] signature = B64_DECODER.decode(matcher.group(3));
-
-        // 1) Algorithm confusion defense: only HS256 is acceptable.
-        String headerJson;
+    public String issueToken(UUID userId, String username) {
         try {
-            headerJson = new String(B64_DECODER.decode(headerSegment), StandardCharsets.UTF_8);
-        } catch (IllegalArgumentException e) {
-            return null;
-        }
-        if (!headerJson.contains("\"alg\":\"" + ALG_HEADER + "\"")) {
-            return null;
-        }
-
-        // 2) Constant-time MAC comparison over header.payload.
-        byte[] expected = hmac(headerSegment + "." + payloadSegment);
-        if (!MessageDigest.isEqual(expected, signature)) {
-            return null;
-        }
-
-        // 3) Claims are now trustworthy — parse and check expiry.
-        String payloadJson;
-        try {
-            payloadJson = new String(B64_DECODER.decode(payloadSegment), StandardCharsets.UTF_8);
-        } catch (IllegalArgumentException e) {
-            return null;
-        }
-        String sub = claim(payloadJson, "sub");
-        String username = claim(payloadJson, "username");
-        String exp = claim(payloadJson, "exp");
-        if (sub == null || username == null || exp == null) {
-            return null;
-        }
-        UUID userId;
-        long expSeconds;
-        try {
-            userId = UUID.fromString(sub);
-            expSeconds = Long.parseLong(exp);
-        } catch (IllegalArgumentException e) {
-            return null;
-        }
-        if (Instant.now().getEpochSecond() >= expSeconds) {
-            return null;
-        }
-        return new Claims(userId, username, expSeconds);
-    }
-
-    private byte[] hmac(String data) {
-        try {
-            Mac mac = Mac.getInstance(ALGORITHM);
-            mac.init(key);
-            return mac.doFinal(data.getBytes(StandardCharsets.UTF_8));
-        } catch (java.security.GeneralSecurityException e) {
-            throw new IllegalStateException("HMAC-SHA256 unavailable", e);
+            Instant now = Instant.now();
+            JWTClaimsSet claims = new JWTClaimsSet.Builder()
+                    .subject(userId.toString())
+                    .claim("username", username)
+                    .issuer(issuer)
+                    .issueTime(Date.from(now))
+                    .expirationTime(Date.from(now.plusSeconds(ttlSeconds)))
+                    .build();
+            SignedJWT jwt = new SignedJWT(
+                    new JWSHeader.Builder(JWSAlgorithm.HS256).build(), claims);
+            jwt.sign(new MACSigner(key.getEncoded()));
+            return jwt.serialize();
+        } catch (Exception e) {
+            // Never surfaces token or key material — a signing failure is an
+            // infrastructure problem, not something to enrich an error with.
+            throw new IllegalStateException("Could not sign access token", e);
         }
     }
 
-    /** Extract a top-level string/number claim from a flat JSON object. */
-    private static String claim(String json, String name) {
-        Matcher matcher = Pattern.compile("\"" + name + "\":\"?([^,\"}]+)\"?").matcher(json);
-        return matcher.find() ? matcher.group(1) : null;
+    /**
+     * The single construction site for the verifying {@link JwtDecoder}:
+     * HS256 with the same secret, plus the standard validator set extended
+     * with issuer checking. Used by {@code SecurityConfig} and by tests, so
+     * what production verifies is exactly what tests verify.
+     */
+    public JwtDecoder createDecoder() {
+        // A symmetric SecretKey selects HS256 by default; anything else in
+        // the header (alg=none, RSA, …) is rejected by the JOSE processor.
+        NimbusJwtDecoder decoder = NimbusJwtDecoder.withSecretKey(key).build();
+        decoder.setJwtValidator(JwtValidators.createDefaultWithIssuer(issuer));
+        return decoder;
     }
 
-    private static String jsonEscape(String value) {
-        return value.replace("\\", "\\\\").replace("\"", "\\\"");
+    public String issuer() {
+        return issuer;
     }
 
-    /** Verified token claims. */
-    public record Claims(UUID userId, String username, long expiresAt) {
+    public long ttlSeconds() {
+        return ttlSeconds;
     }
 }

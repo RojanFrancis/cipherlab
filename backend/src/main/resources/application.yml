@@ -18,11 +18,18 @@ server:
 
 cipherlab:
   security:
-    # HS256 signing secret for access tokens (min 32 chars; the app refuses
-    # to start without one). Override via JWT_SECRET in real deployments —
-    # the dev default below is intentionally weak and public.
-    jwt-secret: ${JWT_SECRET:dev-only-jwt-secret-do-not-use-in-production-0123456789}
+    # HS256 signing secret for access tokens. NO default here on purpose:
+    # a publicly known default secret in the base profile is indistinguishable
+    # from no authentication at all. The app refuses to boot when this is
+    # missing, blank, shorter than 32 chars, or equal to the well-known
+    # development value outside the `dev` profile (see JwtService).
+    # Deployments must set JWT_SECRET (min 32 chars, randomly generated).
+    jwt-secret: ${JWT_SECRET:}
+    # Issuer claim written into every token and validated on every request.
+    jwt-issuer: ${JWT_ISSUER:cipherlab-api}
     jwt-ttl-seconds: ${JWT_TTL_SECONDS:3600}
+    # Only the `dev` profile may set this to true (development defaults).
+    allow-dev-secret: ${ALLOW_DEV_JWT_SECRET:false}
 
 management:
   endpoints:

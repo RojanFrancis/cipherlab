@@ -10,3 +10,11 @@ spring:
   jpa:
     hibernate:
       ddl-auto: none
+
+cipherlab:
+  security:
+    # The ONLY place a default JWT secret may live. It is intentionally weak,
+    # publicly known, and rejected by JwtService whenever the dev profile is
+    # not active (allow-dev-secret defaults to false in application.yml).
+    jwt-secret: dev-only-jwt-secret-do-not-use-in-production-0123456789
+    allow-dev-secret: true
