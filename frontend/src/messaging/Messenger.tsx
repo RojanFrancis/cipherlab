@@ -2,7 +2,7 @@ import { useCallback, useEffect, useState } from 'react'
 import { identity, messaging } from '../lib/api'
 import type { Conversation, CryptoSession, IdentityKey, RelayMessage } from '../lib/api'
 import { ApiError } from '../lib/api'
-import { useAuth } from '../lib/auth'
+import { useAuth } from '../lib/useAuth'
 import { textToBase64, toBase64, truncateMiddle } from '../lib/b64'
 
 /**
@@ -108,6 +108,31 @@ function Authenticated() {
   const [status, setStatus] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
 
+  // Initial load. Fetches in parallel and guards against setting state
+  // after unmount; `refresh` below is reused by the mutation handlers.
+  useEffect(() => {
+    let cancelled = false
+    ;(async () => {
+      try {
+        const [mine, all] = await Promise.all([
+          identity.listMine(),
+          messaging.listConversations(),
+        ])
+        if (!cancelled) {
+          setKeys(mine)
+          setConversations(all)
+        }
+      } catch (e) {
+        if (!cancelled) {
+          setError(e instanceof ApiError ? `${e.code}: ${e.message}` : 'Failed to load')
+        }
+      }
+    })()
+    return () => {
+      cancelled = true
+    }
+  }, [])
+
   const refresh = useCallback(async () => {
     try {
       setKeys(await identity.listMine())
@@ -116,10 +141,6 @@ function Authenticated() {
       setError(e instanceof ApiError ? `${e.code}: ${e.message}` : 'Failed to load')
     }
   }, [])
-
-  useEffect(() => {
-    void refresh()
-  }, [refresh])
 
   const openConversation = async (conversation: Conversation) => {
     setSelected(conversation)

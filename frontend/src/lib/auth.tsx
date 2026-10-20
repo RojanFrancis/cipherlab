@@ -1,7 +1,8 @@
-import { createContext, useCallback, useContext, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useState } from 'react'
 import type { ReactNode } from 'react'
 import { auth, setTokenProvider } from './api'
 import type { User } from './api'
+import { AuthContext } from './useAuth'
 
 /**
  * Auth state for the whole app.
@@ -11,19 +12,12 @@ import type { User } from './api'
  * touch the raw token. (For a real deployment you would weigh localStorage
  * against an httpOnly cookie; the lab keeps it visible so the JWT itself is
  * inspectable in the DevTools network tab.)
+ *
+ * The context and the `useAuth` hook live in `./useAuth` so this file
+ * exports only the component — required for Fast Refresh.
  */
 
 const STORAGE_KEY = 'cipherlab.token'
-
-interface AuthState {
-  user: User | null
-  token: string | null
-  login: (username: string, password: string) => Promise<void>
-  register: (username: string, email: string, password: string) => Promise<void>
-  logout: () => void
-}
-
-const AuthContext = createContext<AuthState | null>(null)
 
 export function AuthProvider({ children }: { children: ReactNode }) {
   const [token, setToken] = useState<string | null>(() => localStorage.getItem(STORAGE_KEY))
@@ -36,9 +30,10 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
   // On load (and on token change), resolve who we are. An invalid or
   // expired token fails quietly — the user simply lands logged out.
+  // `user` is already null when there is no token (initial state, and
+  // logout clears it), so no synchronous setState is needed here.
   useEffect(() => {
     if (!token) {
-      setUser(null)
       return
     }
     let cancelled = false
@@ -51,6 +46,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         if (!cancelled) {
           localStorage.removeItem(STORAGE_KEY)
           setToken(null)
+          setUser(null)
         }
       })
     return () => {
@@ -87,12 +83,4 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   )
 
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>
-}
-
-export function useAuth(): AuthState {
-  const context = useContext(AuthContext)
-  if (!context) {
-    throw new Error('useAuth must be used inside <AuthProvider>')
-  }
-  return context
 }

@@ -1,5 +1,6 @@
 import { useState } from 'react'
-import { AuthProvider, useAuth } from './lib/auth'
+import { AuthProvider } from './lib/auth'
+import { useAuth } from './lib/useAuth'
 import { Lab } from './lab/Lab'
 import { Messenger } from './messaging/Messenger'
 import './App.css'
