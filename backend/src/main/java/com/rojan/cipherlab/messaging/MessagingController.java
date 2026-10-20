@@ -72,6 +72,13 @@ public class MessagingController {
                         request.signature(), request.identityKeyId()));
     }
 
+    @GetMapping("/conversations/{conversationId}/sessions")
+    public List<MessagingService.SessionResponse> listSessions(
+            @AuthenticationPrincipal AuthenticatedUser principal,
+            @PathVariable UUID conversationId) {
+        return messagingService.listSessions(principal.userId(), conversationId);
+    }
+
     @GetMapping("/sessions/{sessionId}")
     public MessagingService.SessionResponse getSession(
             @AuthenticationPrincipal AuthenticatedUser principal,

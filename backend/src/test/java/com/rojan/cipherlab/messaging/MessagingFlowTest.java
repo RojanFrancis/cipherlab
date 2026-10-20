@@ -186,6 +186,7 @@ class MessagingFlowTest {
     void fullMessagingFlow() throws Exception {
         User alice = newUser();
         User bob = newUser();
+        User mallory = newUser();
         Identity aliceIdentity = publishIdentityKey(alice);
         Identity bobIdentity = publishIdentityKey(bob);
 
@@ -201,12 +202,24 @@ class MessagingFlowTest {
         JsonNode session = createSession(alice, conversationId, userIdOf(bob), aliceIdentity);
         String sessionId = session.get("id").asText();
 
-        // The initiator's signed ephemeral is visible to the responder for client-side verification.
+        // The responder discovers the PENDING session via the conversation's session list…
+        mockMvc.perform(get("/api/v1/conversations/" + conversationId + "/sessions")
+                        .header("Authorization", "Bearer " + bob.token()))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.length()").value(1))
+                .andExpect(jsonPath("$[0].status").value("PENDING"));
+
+        // …and its signed ephemeral is visible for client-side verification.
         mockMvc.perform(get("/api/v1/sessions/" + sessionId)
                         .header("Authorization", "Bearer " + bob.token()))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.initiatorEphemeralPublic").isNotEmpty())
                 .andExpect(jsonPath("$.initiatorSignature").isNotEmpty());
+
+        // Outsiders cannot even list sessions.
+        mockMvc.perform(get("/api/v1/conversations/" + conversationId + "/sessions")
+                        .header("Authorization", "Bearer " + mallory.token()))
+                .andExpect(status().isNotFound());
 
         // Relay before the handshake completes is refused — lifecycle is enforced.
         mockMvc.perform(post("/api/v1/sessions/" + sessionId + "/messages")

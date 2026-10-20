@@ -237,6 +237,14 @@ export interface CryptoSession {
   status: 'PENDING' | 'ACTIVE' | 'EXPIRED'
   createdAt: string
   expiresAt: string | null
+  // Public handshake material (verified client-side before use):
+  initiatorEphemeralPublic: string
+  initiatorSignature: string
+  initiatorIdentityKeyId: string
+  responderEphemeralPublic: string | null
+  responderSignature: string | null
+  responderIdentityKeyId: string | null
+  transcriptHash: string | null
 }
 
 export interface RelayMessage {
@@ -254,10 +262,30 @@ export const messaging = {
   createConversation: (partnerId: string) =>
     post<Conversation>('/api/v1/conversations', { partnerId }),
   listConversations: () => get<Conversation[]>('/api/v1/conversations'),
-  createSession: (conversationId: string, suite: string) =>
-    post<CryptoSession>(`/api/v1/conversations/${conversationId}/sessions`, { suite }),
+  createSession: (
+    conversationId: string,
+    sessionId: string,
+    suite: string,
+    ephemeralPublic: string,
+    signature: string,
+    identityKeyId: string,
+  ) =>
+    post<CryptoSession>(`/api/v1/conversations/${conversationId}/sessions`, {
+      sessionId,
+      suite,
+      ephemeralPublic,
+      signature,
+      identityKeyId,
+    }),
+  listSessions: (conversationId: string) =>
+    get<CryptoSession[]>(`/api/v1/conversations/${conversationId}/sessions`),
   getSession: (sessionId: string) => get<CryptoSession>(`/api/v1/sessions/${sessionId}`),
-  activate: (sessionId: string) => post<CryptoSession>(`/api/v1/sessions/${sessionId}/activate`),
+  activate: (sessionId: string, ephemeralPublic: string, signature: string, identityKeyId: string) =>
+    post<CryptoSession>(`/api/v1/sessions/${sessionId}/activate`, {
+      ephemeralPublic,
+      signature,
+      identityKeyId,
+    }),
   relay: (sessionId: string, sequenceNumber: number, nonce: string, ciphertext: string) =>
     post<RelayMessage>(`/api/v1/sessions/${sessionId}/messages`, {
       sequenceNumber,

@@ -208,6 +208,18 @@ public class MessagingService {
         return SessionResponse.of(session);
     }
 
+    /**
+     * Sessions of a conversation, members only. This is how a responder
+     * discovers the initiator's PENDING session and its signed ephemeral.
+     */
+    @Transactional(readOnly = true)
+    public List<SessionResponse> listSessions(UUID userId, UUID conversationId) {
+        requireMember(conversationId, userId);
+        return sessionRepository.findByConversationIdOrderByCreatedAtAsc(conversationId).stream()
+                .map(SessionResponse::of)
+                .toList();
+    }
+
     @Transactional(readOnly = true)
     public SessionResponse getSession(UUID userId, UUID sessionId) {
         CryptoSession session = sessionRepository.findById(sessionId).orElseThrow(NotFoundException::new);
