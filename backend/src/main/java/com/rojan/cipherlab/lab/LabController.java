@@ -56,4 +56,29 @@ public class LabController {
     public LabResponses.DiffieHellman diffieHellman(@Valid @RequestBody LabRequests.DiffieHellman request) {
         return labService.diffieHellman(request);
     }
+
+    @PostMapping("/hkdf")
+    public LabResponses.Hkdf hkdf(@Valid @RequestBody LabRequests.Hkdf request) {
+        return labService.hkdf(request);
+    }
+
+    @PostMapping("/signatures/keygen")
+    public LabResponses.SignatureKeygen signatureKeygen() {
+        return labService.signatureKeygen();
+    }
+
+    @PostMapping("/signatures/sign")
+    public LabResponses.Signature sign(@Valid @RequestBody LabRequests.Sign request) {
+        return labService.sign(request);
+    }
+
+    @PostMapping("/signatures/verify")
+    public LabResponses.SignatureVerification verify(@Valid @RequestBody LabRequests.Verify request) {
+        return labService.verify(request);
+    }
+
+    @PostMapping("/mitm/simulate")
+    public LabResponses.Mitm mitm(@Valid @RequestBody LabRequests.Mitm request) {
+        return labService.mitm(request);
+    }
 }

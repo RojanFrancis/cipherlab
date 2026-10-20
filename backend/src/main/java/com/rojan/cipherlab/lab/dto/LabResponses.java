@@ -44,4 +44,38 @@ public final class LabResponses {
             String sharedSecret,
             List<String> steps,
             String securityNote) {}
+
+    public record Hkdf(
+            String algorithm,
+            String ikmB64,
+            String saltB64,
+            String info,
+            Integer outputLength,
+            String prkHex,
+            String outputHex,
+            List<String> steps,
+            String securityNote) {}
+
+    public record SignatureKeygen(
+            String algorithm,
+            String privateKey,
+            String publicKey,
+            String fingerprint,
+            String securityNote) {}
+
+    public record Signature(
+            String algorithm,
+            String signature,
+            String messageSha256) {}
+
+    public record SignatureVerification(Boolean valid, String fingerprint, String explanation) {}
+
+    public record Mitm(
+            String mode,
+            List<String> participants,
+            java.util.Map<String, String> sharedSecrets,
+            Boolean malloryCanRead,
+            Boolean substitutionDetected,
+            List<String> steps,
+            String securityNote) {}
 }
