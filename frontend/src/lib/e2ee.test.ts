@@ -16,11 +16,14 @@ import {
   signTranscript,
   verifyTranscript,
   deriveSessionKeys,
+  establishInitiatorSession,
   fingerprintOfSpki,
   fromB64,
   toB64,
+  SUITE,
 } from './e2ee'
-import type { HandshakeMeta, MessageMeta } from './e2ee'
+import type { HandshakeMeta, InitiatorExpectation, InitiatorSessionResult, MessageMeta } from './e2ee'
+import type { CryptoSession, IdentityKey } from './api'
 
 const META: HandshakeMeta = {
   sessionId: '11111111-2222-4333-8444-555555555555',
@@ -223,5 +226,245 @@ describe('message authentication', () => {
     await expect(
       decryptMessage(h.bobKeys.receiveKey, { ...meta, conversationId: '00000000-0000-4000-8000-000000000000' }, envelope.nonceB64, envelope.ciphertextB64),
     ).rejects.toThrow()
+  })
+})
+
+// ---------------------------------------------------------------- initiator-side peer authentication
+//
+// Regression suite for the v1.1 review finding: the initiator used to take
+// the server's ACTIVE flag at face value and derive keys without ever
+// checking the responder's signature. Every case below must fail closed —
+// `{ verified: false }` and NO key material — except the valid handshake.
+
+async function initiatorFixture() {
+  const alice = await generateIdentityKeyPair() // initiator
+  const bob = await generateIdentityKeyPair() // responder
+  const ephA = await generateEphemeralKeyPair()
+  const ephB = await generateEphemeralKeyPair()
+  const initiatorSignature = await signTranscript(alice.privateKey, initiatorTranscript(META, ephA.spkiB64))
+  const responderSignature = await signTranscript(
+    bob.privateKey,
+    fullTranscript(META, ephA.spkiB64, ephB.spkiB64),
+  )
+  const session: CryptoSession = {
+    id: META.sessionId,
+    conversationId: META.conversationId,
+    initiatorId: META.initiatorId,
+    responderId: META.responderId,
+    suite: SUITE,
+    status: 'ACTIVE',
+    createdAt: '2026-01-01T00:00:00',
+    expiresAt: null,
+    initiatorEphemeralPublic: ephA.spkiB64,
+    initiatorSignature,
+    initiatorIdentityKeyId: 'key-alice',
+    responderEphemeralPublic: ephB.spkiB64,
+    responderSignature,
+    responderIdentityKeyId: 'key-bob',
+    transcriptHash: null,
+  }
+  const responderKeys: IdentityKey[] = [
+    {
+      id: 'key-bob',
+      userId: META.responderId,
+      keyType: 'EC_P256',
+      publicKey: bob.spkiB64,
+      fingerprint: bob.fingerprintHex,
+      keyVersion: 1,
+      createdAt: '2026-01-01T00:00:00',
+      revoked: false,
+      revokedAt: null,
+    },
+  ]
+  const expected: InitiatorExpectation = {
+    meta: META,
+    suite: SUITE,
+    initiatorEphemeralPublic: ephA.spkiB64,
+    initiatorIdentityKeyId: 'key-alice',
+    initiatorIdentityPublicKey: alice.spkiB64,
+  }
+  return { bob, ephA, ephB, session, responderKeys, expected }
+}
+
+/** Asserts verification failed AND that no key material came back. */
+function expectRejected(result: InitiatorSessionResult, pattern: RegExp): void {
+  expect(result.verified).toBe(false)
+  expect('keys' in result).toBe(false)
+  if (result.verified) throw new Error(`expected rejection matching ${pattern}`)
+  expect(result.reason).toMatch(pattern)
+}
+
+describe('initiator-side responder authentication', () => {
+  it('accepts a valid two-user handshake and derives keys both sides agree on', async () => {
+    const f = await initiatorFixture()
+    const result = await establishInitiatorSession(f.expected, f.session, f.responderKeys, f.ephA.privateKey)
+    expect(result.verified).toBe(true)
+    if (!result.verified) throw new Error(result.reason)
+
+    // The responder derives independently from the same transcript: the
+    // initiator's send key must be the responder's receive key.
+    const bobKeys = await deriveSessionKeys(META, f.ephA.spkiB64, f.ephB.spkiB64, f.ephB.privateKey, false)
+    const meta: MessageMeta = {
+      sessionId: META.sessionId,
+      conversationId: META.conversationId,
+      senderId: META.initiatorId,
+      sequenceNumber: 0,
+    }
+    const envelope = await encryptMessage(result.keys.sendKey, meta, 'handshake verified')
+    expect(await decryptMessage(bobKeys.receiveKey, meta, envelope.nonceB64, envelope.ciphertextB64)).toBe(
+      'handshake verified',
+    )
+  })
+
+  it('rejects an invalid responder signature', async () => {
+    // (a) Signed by a key that is not the responder's published one.
+    const a = await initiatorFixture()
+    const mallory = await generateIdentityKeyPair()
+    a.session.responderSignature = await signTranscript(
+      mallory.privateKey,
+      fullTranscript(META, a.ephA.spkiB64, a.ephB.spkiB64),
+    )
+    expectRejected(
+      await establishInitiatorSession(a.expected, a.session, a.responderKeys, a.ephA.privateKey),
+      /responder signature did NOT verify/,
+    )
+
+    // (b) A corrupted signature fails closed instead of throwing.
+    const b = await initiatorFixture()
+    const sig = b.session.responderSignature
+    if (!sig) throw new Error('fixture missing responder signature')
+    const bytes = fromB64(sig)
+    bytes[bytes.length - 1] ^= 0x01
+    b.session.responderSignature = toB64(bytes)
+    expectRejected(
+      await establishInitiatorSession(b.expected, b.session, b.responderKeys, b.ephA.privateKey),
+      /responder signature did NOT verify/,
+    )
+  })
+
+  it('rejects a substituted responder ephemeral key', async () => {
+    const f = await initiatorFixture()
+    const substituted = await generateEphemeralKeyPair()
+    // The server swaps in ITS ephB; the real responder's signature was
+    // made over the original one — verification must catch it.
+    f.session.responderEphemeralPublic = substituted.spkiB64
+    expectRejected(
+      await establishInitiatorSession(f.expected, f.session, f.responderKeys, f.ephA.privateKey),
+      /responder signature did NOT verify/,
+    )
+  })
+
+  it('rejects incorrect responder identity-key references', async () => {
+    // (a) The referenced key is not among the responder's published keys.
+    const a = await initiatorFixture()
+    a.session.responderIdentityKeyId = 'key-ghost'
+    expectRejected(
+      await establishInitiatorSession(a.expected, a.session, a.responderKeys, a.ephA.privateKey),
+      /does not resolve/,
+    )
+
+    // (b) The referenced key belongs to a different user.
+    const b = await initiatorFixture()
+    b.responderKeys = [{ ...b.responderKeys[0], userId: META.initiatorId }]
+    expectRejected(
+      await establishInitiatorSession(b.expected, b.session, b.responderKeys, b.ephA.privateKey),
+      /does not belong to the responder/,
+    )
+  })
+
+  it('rejects an identity key that does not match its published fingerprint', async () => {
+    const f = await initiatorFixture()
+    f.responderKeys = [{ ...f.responderKeys[0], fingerprint: '0'.repeat(64) }]
+    expectRejected(
+      await establishInitiatorSession(f.expected, f.session, f.responderKeys, f.ephA.privateKey),
+      /does not match its published fingerprint/,
+    )
+  })
+
+  it('rejects a revoked responder identity key', async () => {
+    const f = await initiatorFixture()
+    f.responderKeys = [{ ...f.responderKeys[0], revoked: true }]
+    expectRejected(
+      await establishInitiatorSession(f.expected, f.session, f.responderKeys, f.ephA.privateKey),
+      /revoked/,
+    )
+  })
+
+  it('rejects a transcript the responder signed over different session context', async () => {
+    const f = await initiatorFixture()
+    const otherContext: HandshakeMeta = { ...META, sessionId: '11111111-2222-4333-8444-777777777777' }
+    f.session.responderSignature = await signTranscript(
+      f.bob.privateKey,
+      fullTranscript(otherContext, f.ephA.spkiB64, f.ephB.spkiB64),
+    )
+    expectRejected(
+      await establishInitiatorSession(f.expected, f.session, f.responderKeys, f.ephA.privateKey),
+      /responder signature did NOT verify/,
+    )
+  })
+
+  it('rejects session records that do not match the handshake this client created', async () => {
+    // (a) A different conversation.
+    const a = await initiatorFixture()
+    a.session.conversationId = '99999999-8888-4777-8666-000000000000'
+    expectRejected(
+      await establishInitiatorSession(a.expected, a.session, a.responderKeys, a.ephA.privateKey),
+      /different conversation/,
+    )
+
+    // (b) An initiator ephemeral that is not the one we generated.
+    const b = await initiatorFixture()
+    b.session.initiatorEphemeralPublic = (await generateEphemeralKeyPair()).spkiB64
+    expectRejected(
+      await establishInitiatorSession(b.expected, b.session, b.responderKeys, b.ephA.privateKey),
+      /initiator ephemeral public key does not match/,
+    )
+
+    // (c) An identity-key reference to a key we did not sign with.
+    const c = await initiatorFixture()
+    c.session.initiatorIdentityKeyId = 'key-alice-old'
+    expectRejected(
+      await establishInitiatorSession(c.expected, c.session, c.responderKeys, c.ephA.privateKey),
+      /initiator identity-key reference/,
+    )
+
+    // (d) A swapped suite (protocol context).
+    const d = await initiatorFixture()
+    d.session.suite = 'EC_P256+PLAINTEXT'
+    expectRejected(
+      await establishInitiatorSession(d.expected, d.session, d.responderKeys, d.ephA.privateKey),
+      /suite/,
+    )
+
+    // (e) A session id that is not the one this client created.
+    const e = await initiatorFixture()
+    e.session.id = '11111111-2222-4333-8444-777777777777'
+    expectRejected(
+      await establishInitiatorSession(e.expected, e.session, e.responderKeys, e.ephA.privateKey),
+      /session id does not match/,
+    )
+  })
+
+  it('never derives keys from an ACTIVE session whose peer authentication is invalid', async () => {
+    // The server reports ACTIVE with incomplete material: fail closed.
+    const a = await initiatorFixture()
+    expect(a.session.status).toBe('ACTIVE')
+    a.session.responderSignature = null
+    expectRejected(
+      await establishInitiatorSession(a.expected, a.session, a.responderKeys, a.ephA.privateKey),
+      /responder handshake material is missing/,
+    )
+
+    // ACTIVE with complete-looking material signed by the wrong key: same
+    // outcome — and the caller has no keys to send or decrypt with.
+    const b = await initiatorFixture()
+    const mallory = await generateIdentityKeyPair()
+    b.session.responderSignature = await signTranscript(
+      mallory.privateKey,
+      fullTranscript(META, b.ephA.spkiB64, b.ephB.spkiB64),
+    )
+    const result = await establishInitiatorSession(b.expected, b.session, b.responderKeys, b.ephA.privateKey)
+    expect(result.verified).toBe(false)
+    expect('keys' in result).toBe(false)
   })
 })

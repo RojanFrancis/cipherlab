@@ -8,6 +8,7 @@ import {
   SUITE,
   decryptMessage,
   deriveSessionKeys,
+  establishInitiatorSession,
   encryptMessage,
   fullTranscript,
   generateEphemeralKeyPair,
@@ -17,7 +18,14 @@ import {
   signTranscript,
   verifyTranscript,
 } from '../lib/e2ee'
-import type { HandshakeMeta, IdentityKeyPair, SessionKeys } from '../lib/e2ee'
+import type { HandshakeMeta, IdentityKeyPair, InitiatorExpectation, SessionKeys } from '../lib/e2ee'
+
+/** Local record of what this client itself contributed to a handshake it initiated. */
+interface InitiatorContext {
+  ephemeralPublic: string
+  identityKeyId: string
+  identityPublicKey: string
+}
 
 /**
  * Secure Messenger — genuine end-to-end encryption in the browser.
@@ -135,6 +143,12 @@ function Authenticated() {
   // Private material, keyed by session id — never serialized, never stored.
   const ephemeralPrivates = useRef(new Map<string, CryptoKey>())
   const sessionKeys = useRef(new Map<string, SessionKeys>())
+  // What THIS client generated when it opened each session — the local
+  // expectation that every server-echoed record is checked against before
+  // any key is derived.
+  const handshakeContext = useRef(new Map<string, InitiatorContext>())
+  const verifyingSessions = useRef(new Set<string>())
+  const rejectedSessions = useRef(new Set<string>())
 
   const showError = useCallback((e: unknown, fallback: string) => {
     setError(e instanceof ApiError ? `${e.code}: ${e.message}` : fallback)
@@ -277,6 +291,11 @@ function Authenticated() {
       }
       const signature = await signTranscript(identity.privateKey, initiatorTranscript(meta, eph.spkiB64))
       ephemeralPrivates.current.set(sessionId, eph.privateKey)
+      handshakeContext.current.set(sessionId, {
+        ephemeralPublic: eph.spkiB64,
+        identityKeyId: myPublished.id,
+        identityPublicKey: myPublished.publicKey,
+      })
       await messaging.createSession(selected.id, sessionId, SUITE, eph.spkiB64, signature, myPublished.id)
       setStatus('Handshake started: your signed ephemeral is on the server. The partner must complete it.')
       await refreshChannel(selected.id)
@@ -344,36 +363,75 @@ function Authenticated() {
     }
   }
 
-  // The initiator derives keys once the session turns ACTIVE.
+  // The initiator authenticates the responder BEFORE deriving anything.
+  // The server's ACTIVE flag is lifecycle bookkeeping, not proof of peer
+  // authentication: every echoed field is checked against what this client
+  // generated, the responder's signature is verified over the exact
+  // canonical transcript under its published (non-revoked,
+  // fingerprint-consistent) identity key, and keys come out only if every
+  // check passes. Missing, revoked, malformed or mismatched material →
+  // fail closed: no keys, no authenticated session, no sending.
   const [derivedSessionIds, setDerivedSessionIds] = useState<Set<string>>(new Set())
   useEffect(() => {
+    if (!user || !selected) return
     let cancelled = false
     const pending = sessions.filter(
       (s) => s.status === 'ACTIVE' && !sessionKeys.current.has(s.id) && ephemeralPrivates.current.has(s.id),
     )
     for (const session of pending) {
+      if (verifyingSessions.current.has(session.id) || rejectedSessions.current.has(session.id)) continue
       const ephPrivate = ephemeralPrivates.current.get(session.id)
-      if (!ephPrivate) continue
-      const meta: HandshakeMeta = {
-        sessionId: session.id,
-        conversationId: session.conversationId,
-        initiatorId: session.initiatorId,
-        responderId: session.responderId,
+      const context = handshakeContext.current.get(session.id)
+      const partnerId = selected.memberIds.find((id) => id !== user.id)
+      if (!ephPrivate || !context || !partnerId) {
+        // Without our own record of this handshake there is nothing to
+        // compare the server's claims against — never derive blind.
+        rejectedSessions.current.add(session.id)
+        setError('Handshake verification failed: no local record of this session — no keys derived.')
+        continue
       }
-      deriveSessionKeys(meta, session.initiatorEphemeralPublic, session.responderEphemeralPublic ?? '', ephPrivate, true)
-        .then((derived) => {
+      const expected: InitiatorExpectation = {
+        meta: {
+          sessionId: session.id,
+          conversationId: selected.id,
+          initiatorId: user.id,
+          responderId: partnerId,
+        },
+        suite: SUITE,
+        initiatorEphemeralPublic: context.ephemeralPublic,
+        initiatorIdentityKeyId: context.identityKeyId,
+        initiatorIdentityPublicKey: context.identityPublicKey,
+      }
+      verifyingSessions.current.add(session.id)
+      ;(async () => {
+        // Responder keys come from the same identity-key workflow the
+        // responder side uses for us: published keys of that user, checked
+        // here before anything is trusted.
+        const responderKeys = await identityApi.forUser(expected.meta.responderId)
+        return establishInitiatorSession(expected, session, responderKeys, ephPrivate)
+      })()
+        .then((result) => {
           if (cancelled) return
-          sessionKeys.current.set(session.id, derived)
-          setDerivedSessionIds(new Set(sessionKeys.current.keys()))
+          if (result.verified) {
+            sessionKeys.current.set(session.id, result.keys)
+            setDerivedSessionIds(new Set(sessionKeys.current.keys()))
+            setStatus('Responder signature verified against their published identity key — secure channel ready.')
+          } else {
+            rejectedSessions.current.add(session.id)
+            setError(`Handshake verification failed: ${result.reason} — no keys derived.`)
+          }
         })
-        .catch(() => {
-          /* derivation cannot fail with valid P-256 keys; ignore */
+        .catch((e) => {
+          if (!cancelled) showError(e, 'Could not verify the responder handshake — no keys derived.')
+        })
+        .finally(() => {
+          verifyingSessions.current.delete(session.id)
         })
     }
     return () => {
       cancelled = true
     }
-  }, [sessions])
+  }, [sessions, user, selected, showError])
 
   // --------------------------------------------- messages
 

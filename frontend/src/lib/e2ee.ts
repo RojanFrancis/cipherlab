@@ -22,6 +22,8 @@
  *      without failing authentication.
  */
 
+import type { CryptoSession, IdentityKey } from './api'
+
 export const SUITE = 'EC_P256+HKDF-SHA256+AES-256-GCM'
 const TRANSCRIPT_PREFIX = 'cipherlab-session-v1'
 
@@ -325,6 +327,145 @@ function uuidBytes(uuid: string): Uint8Array {
   const out = new Uint8Array(16)
   for (let i = 0; i < 16; i += 1) out[i] = parseInt(hex.slice(i * 2, i * 2 + 2), 16)
   return out
+}
+
+// ---------------------------------------------------------------- initiator-side peer authentication
+
+/**
+ * Everything the initiator can vouch for from memory it generated itself at
+ * creation time: the handshake metadata, the ephemeral public half it
+ * produced, and the identity key (id + published public key) it signed
+ * with. Nothing in this struct comes from the server.
+ */
+export interface InitiatorExpectation {
+  meta: HandshakeMeta
+  suite: string
+  initiatorEphemeralPublic: string
+  initiatorIdentityKeyId: string
+  initiatorIdentityPublicKey: string
+}
+
+/** Keys are present ONLY when every verification check passed. */
+export type InitiatorSessionResult =
+  | { verified: true; keys: SessionKeys }
+  | { verified: false; reason: string }
+
+/**
+ * Initiator-side authentication of the responder, run before a single
+ * key is derived. The server's `ACTIVE` status is lifecycle bookkeeping —
+ * never proof that the peer proved possession of its identity key — so
+ * this function ignores it entirely and checks, fail-closed:
+ *
+ *  1. the session record matches the handshake THIS client created
+ *     (session id, conversation, both participants, suite, the initiator's
+ *     own ephemeral public key and identity-key reference/signature);
+ *  2. the activation material is complete (responder ephemeral public key,
+ *     signature and identity-key reference all present);
+ *  3. the referenced identity key resolves among the responder's PUBLISHED
+ *     keys (the existing identity-key workflow), belongs to the responder,
+ *     is not revoked, is EC_P256, and matches its own published fingerprint;
+ *  4. the responder ephemeral is a well-formed P-256 key;
+ *  5. the responder's signature verifies over the EXACT canonical full
+ *     transcript (prefix | sessionId | conversationId | initiatorId |
+ *     responderId | suite | A:ephA | B:ephB) under that published key.
+ *
+ * Missing keys, invalid signatures, revoked identities, malformed keys and
+ * mismatched session data all return `{ verified: false, reason }` and no
+ * key material — the caller must not derive, send, or mark the session
+ * authenticated in that case.
+ */
+export async function establishInitiatorSession(
+  expected: InitiatorExpectation,
+  session: CryptoSession,
+  responderKeys: IdentityKey[],
+  myEphemeralPrivate: CryptoKey,
+): Promise<InitiatorSessionResult> {
+  const fail = (reason: string): InitiatorSessionResult => ({ verified: false, reason })
+
+  // 1. Protocol context: the echoed record must be the handshake we created.
+  if (expected.suite !== SUITE) {
+    return fail(`unsupported suite "${expected.suite}"`)
+  }
+  if (session.id !== expected.meta.sessionId) {
+    return fail('session id does not match the handshake this client created')
+  }
+  if (session.conversationId !== expected.meta.conversationId) {
+    return fail('session belongs to a different conversation')
+  }
+  if (session.initiatorId !== expected.meta.initiatorId) {
+    return fail('session initiator is not this user')
+  }
+  if (session.responderId !== expected.meta.responderId) {
+    return fail('session responder is not the conversation partner')
+  }
+  if (session.suite !== expected.suite) {
+    return fail('session suite does not match the negotiated suite')
+  }
+  if (!session.initiatorEphemeralPublic ||
+      session.initiatorEphemeralPublic !== expected.initiatorEphemeralPublic) {
+    return fail('initiator ephemeral public key does not match the one this client generated')
+  }
+  if (session.initiatorIdentityKeyId !== expected.initiatorIdentityKeyId) {
+    return fail('initiator identity-key reference does not match the key this client signed with')
+  }
+  if (!session.initiatorSignature ||
+      !(await verifyTranscript(
+        expected.initiatorIdentityPublicKey,
+        initiatorTranscript(expected.meta, expected.initiatorEphemeralPublic),
+        session.initiatorSignature,
+      ))) {
+    return fail('initiator signature on the session record does not match this handshake')
+  }
+
+  // 2. Activation material must be complete — ACTIVE alone proves nothing.
+  const responderEphB = session.responderEphemeralPublic
+  const responderSignature = session.responderSignature
+  const responderKeyId = session.responderIdentityKeyId
+  if (!responderEphB || !responderSignature || !responderKeyId) {
+    return fail('session claims activation but the responder handshake material is missing')
+  }
+
+  // 3. Responder identity key through the existing published-key workflow.
+  const responderKey = responderKeys.find((k) => k.id === responderKeyId)
+  if (!responderKey) {
+    return fail('responder identity-key reference does not resolve to a published key of the responder')
+  }
+  if (responderKey.userId !== expected.meta.responderId) {
+    return fail('referenced identity key does not belong to the responder')
+  }
+  if (responderKey.revoked) {
+    return fail('responder identity key is revoked')
+  }
+  if (responderKey.keyType !== 'EC_P256') {
+    return fail(`responder identity key is ${responderKey.keyType}, not EC_P256`)
+  }
+  if ((await fingerprintOfSpki(responderKey.publicKey)) !== responderKey.fingerprint) {
+    return fail('responder identity key material does not match its published fingerprint')
+  }
+
+  // 4. The responder ephemeral must be a well-formed P-256 key.
+  try {
+    await importEphemeralPublic(responderEphB)
+  } catch {
+    return fail('responder ephemeral public key is not a valid P-256 key')
+  }
+
+  // 5. THE authentication check: the responder's own signature over the
+  //    exact expected canonical transcript, under its published identity key.
+  const transcript = fullTranscript(expected.meta, expected.initiatorEphemeralPublic, responderEphB)
+  if (!(await verifyTranscript(responderKey.publicKey, transcript, responderSignature))) {
+    return fail('responder signature did NOT verify over the expected transcript')
+  }
+
+  // Every check passed — only now derive, from exactly the verified material.
+  const keys = await deriveSessionKeys(
+    expected.meta,
+    expected.initiatorEphemeralPublic,
+    responderEphB,
+    myEphemeralPrivate,
+    true,
+  )
+  return { verified: true, keys }
 }
 
 // ---------------------------------------------------------------- messages
